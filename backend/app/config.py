@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     bailian_embedding_dimensions: int = 1024
     llm_mock_mode: bool = True
     enable_elasticsearch: bool = False
+    enable_neo4j: bool = False
+    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = ""
     cors_origins: List[str] = ["http://localhost:5173", "http://localhost:8080"]
     retrieval_timeout_seconds: float = 2.5
     retrieval_max_workers: int = 5

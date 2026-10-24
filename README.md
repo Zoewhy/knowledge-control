@@ -9,7 +9,7 @@
 - Wiki 编译：新建页面、增量合并、新增 Section、重复内容仅补来源、高风险变更进入 Review Gate
 - Review 工作台：来源 Claim、原文片段、目标 Wiki 聚合，支持修改 Scope、Owner、拟合并内容和目标 Section
 - Wiki-first 并行混合检索：Wiki 词法/向量、Source 词法/向量、Elasticsearch BM25、每分支超时与降级诊断
-- 持久化实体关系 GraphRAG：跨 WikiPage/Document 路径扩展和 `graph_query`
+- 持久化实体关系 GraphRAG：生产环境写入 Neo4j（`Entity` / `Section` / `CO_OCCURS` 关系），本地未配置时降级为 SQL 共现图；支持跨 WikiPage/Document 路径扩展和 `graph_query`
 - Agent Runtime：Celery 调度、计划校验、工具/action 白名单、风险审批、step 幂等、事件、结构化失败诊断、恢复、replay 和产物回流
 - Integration Gateway：飞书事件订阅（URL 验证、token 校验、事件幂等去重），消息指令路由（`文档 <token>` / `问答:` / `用例:` / `归因:`）到知识接入、问答、测试生成和告警归因任务
 - QA 测试闭环：`prd_parse → knowledge_search → testpoint_generate → testcase_generate → coverage_review → report_generate`，结构化用例入库（`QaRequirement / QaTestSuite / QaTestCase`），Markdown 报告产物可回流知识库
@@ -19,7 +19,7 @@
 
 ## 技术栈
 
-FastAPI、Pydantic、SQLAlchemy/Alembic、PostgreSQL/pgvector、Elasticsearch、Redis/Celery、Vue 3、OpenAI-compatible Gateway（阿里云百炼）。本地快速模式使用 SQLite 和确定性 mock；生产容器使用 PostgreSQL、Elasticsearch、Redis 和 Celery 异步执行。
+FastAPI、Pydantic、SQLAlchemy/Alembic、PolarDB PostgreSQL/pgvector、Elasticsearch、Neo4j（GraphRAG 图存储）、Redis/Celery、Vue 3、OpenAI-compatible Gateway（阿里云百炼）。PolarDB PostgreSQL 与社区 PostgreSQL 协议兼容，本地快速模式使用 SQLite 和确定性 mock；生产容器使用 PostgreSQL（可替换为 PolarDB 连接串）、Elasticsearch、Neo4j、Redis 和 Celery 异步执行。
 
 ## 快速启动（本地轻量模式）
 
@@ -57,8 +57,11 @@ BAILIAN_EMBEDDING_MODEL=text-embedding-v3
 BAILIAN_EMBEDDING_DIMENSIONS=1024
 LLM_MOCK_MODE=false
 ENABLE_ELASTICSEARCH=false
+ENABLE_NEO4J=false
 AGENT_EXECUTION_MODE=sync
 ```
+
+图存储默认使用 SQL 共现图（零外部依赖）。配置 `ENABLE_NEO4J=true` 及 `NEO4J_URI/NEO4J_USER/NEO4J_PASSWORD` 后切换到 Neo4j；Neo4j 不可达时自动降级回 SQL 图。生产数据库将 `DATABASE_URL` 指向 PolarDB PostgreSQL 连接串即可，驱动与 SQL 方言完全兼容。
 
 本地开发默认同步执行 Agent；完整容器模式使用 `AGENT_EXECUTION_MODE=celery` 投递到 Redis/Celery。飞书导入还需要：
 
@@ -147,4 +150,4 @@ python backend/scripts/smoke.py
 
 ## 后续生产化建议
 
-当前已具备核心链路和本地/容器降级路径。进一步上线建议补充 HNSW/IVFFlat 向量索引、独立图数据库或更细粒度语义关系抽取、OIDC/RBAC、对象存储、OpenTelemetry、真实 RAGAS/LLM-as-judge 服务和细粒度租户隔离。生产性能与 pre1 回归结果必须以对应环境的实测报告为准。
+当前已具备核心链路和本地/容器降级路径。进一步上线建议补充 HNSW/IVFFlat 向量索引、LLM 实体链接与语义谓词抽取（替换共现边）、OIDC/RBAC、对象存储、OpenTelemetry、真实 RAGAS/LLM-as-judge 服务和细粒度租户隔离。生产性能与 pre1 回归结果必须以对应环境的实测报告为准。
