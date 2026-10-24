@@ -11,8 +11,11 @@
 - Wiki-first 并行混合检索：Wiki 词法/向量、Source 词法/向量、Elasticsearch BM25、每分支超时与降级诊断
 - 持久化实体关系 GraphRAG：跨 WikiPage/Document 路径扩展和 `graph_query`
 - Agent Runtime：Celery 调度、计划校验、工具/action 白名单、风险审批、step 幂等、事件、结构化失败诊断、恢复、replay 和产物回流
+- Integration Gateway：飞书事件订阅（URL 验证、token 校验、事件幂等去重），消息指令路由（`文档 <token>` / `问答:` / `用例:` / `归因:`）到知识接入、问答、测试生成和告警归因任务
+- QA 测试闭环：`prd_parse → knowledge_search → testpoint_generate → testcase_generate → coverage_review → report_generate`，结构化用例入库（`QaRequirement / QaTestSuite / QaTestCase`），Markdown 报告产物可回流知识库
+- 告警归因：通用告警 Webhook（fingerprint 幂等、重复告警合并计数）、`alert_context_collect → knowledge_search → graph_query → incident_hypothesis_generate → incident_record_create` 归因链，高风险事故记录创建需人工审批，输出仅包含根因假设与不确定性说明
 - Evaluation Engine 与 Scorer Registry：`source_hit`、`wiki_hit`、`citation_validity`、`rag_no_hit`、latency/p95、`pass_rate`
-- Vue 管理台、Alembic 增量迁移、Docker Compose 与 smoke 脚本
+- Vue 管理台（含集成事件、QA Studio、告警归因视图）、Alembic 增量迁移、Docker Compose 与 smoke 脚本
 
 ## 技术栈
 
@@ -64,6 +67,16 @@ FEISHU_APP_ID=cli_xxx
 FEISHU_APP_SECRET=your-secret
 FEISHU_BASE_URL=https://open.feishu.cn/open-apis
 ```
+
+飞书事件订阅（Integration Gateway）额外配置：
+
+```dotenv
+FEISHU_VERIFICATION_TOKEN=事件订阅的 verification token
+FEISHU_DEFAULT_CHAT_ID=任务完成通知的默认群 chat_id
+FEISHU_NOTIFY_ON_TASK_DONE=true
+```
+
+注意：当前版本仅支持明文事件订阅；飞书 Encrypt Key 加密事件尚未实现解密（`FEISHU_ENCRYPT_KEY` 仅为预留配置）。告警平台通过通用 Webhook `POST /api/v1/integrations/alerts` 接入，未接入真实监控平台时归因结果仅为“根因假设”。
 
 未配置模型 Key 或 `LLM_MOCK_MODE=true` 时，Claim 抽取、用例生成与回答使用确定性 mock。未配置飞书凭证时，飞书接口会返回明确的配置错误，不会静默使用假数据。
 

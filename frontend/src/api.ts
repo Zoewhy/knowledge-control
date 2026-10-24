@@ -121,3 +121,67 @@ export type EvaluationRun = {
   }>
 }
 
+export type IntegrationEvent = {
+  id: string
+  provider: string
+  event_id?: string | null
+  event_type: string
+  status: string
+  agent_task_id?: string | null
+  error?: string | null
+  created_at: string
+}
+
+export type QaRequirement = {
+  id: string
+  title: string
+  content: string
+  parsed: Record<string, unknown>
+  created_at: string
+}
+
+export type QaTestSuite = {
+  id: string
+  requirement_id: string
+  task_id?: string | null
+  name: string
+  status: string
+  summary: Record<string, unknown>
+  testpoints: Array<{ name: string; type: string; priority: string; rationale?: string }>
+  cases: Array<{
+    id: string
+    name: string
+    priority: string
+    precondition: string
+    steps: string[]
+    expected_result: string
+  }>
+  created_at: string
+}
+
+export type AlertEvent = {
+  id: string
+  title: string
+  service: string
+  severity: string
+  status: string
+  description: string
+  occurrence_count: number
+  triage: Record<string, any>
+  agent_task_id?: string | null
+  created_at: string
+}
+
+export type IncidentRecord = {
+  id: string
+  alert_id: string
+  title: string
+  severity: string
+  status: string
+  summary: string
+  root_cause_hypothesis: string
+  impact: string
+  recommended_actions: string[]
+  created_at: string
+}
+

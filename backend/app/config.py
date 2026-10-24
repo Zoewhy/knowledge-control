@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     feishu_app_id: str = ""
     feishu_app_secret: str = ""
     feishu_base_url: str = "https://open.feishu.cn/open-apis"
+    feishu_verification_token: str = ""
+    feishu_encrypt_key: str = ""
+    feishu_default_chat_id: str = ""
+    feishu_notify_on_task_done: bool = True
+    integration_payload_max_bytes: int = 256 * 1024
 
     @field_validator("cors_origins", mode="before")
     @classmethod

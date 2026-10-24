@@ -8,7 +8,19 @@ import httpx
 def main() -> int:
     base = os.getenv("SMOKE_BASE_URL", "http://localhost:8000/api/v1")
     write_checks = os.getenv("SMOKE_WRITE", "false").lower() == "true"
-    checks = ["/health", "/dashboard", "/wiki", "/tools", "/reviews", "/evaluations/runs"]
+    checks = [
+        "/health",
+        "/dashboard",
+        "/wiki",
+        "/tools",
+        "/reviews",
+        "/evaluations/runs",
+        "/integrations/events",
+        "/qa/requirements",
+        "/qa/test-suites",
+        "/alerts",
+        "/incidents",
+    ]
     with httpx.Client(timeout=20) as client:
         for path in checks:
             response = client.get(f"{base}{path}")
@@ -53,7 +65,34 @@ def main() -> int:
         run.raise_for_status()
         metrics = run.json()["metrics"]
         assert "wiki_hit" in metrics and "p95_latency_ms" in metrics
-        print("PASS write smoke: document, agent, artifact reflow, evaluation")
+        requirement = client.post(
+            f"{base}/qa/requirements",
+            json={
+                "title": f"Smoke 登录需求 {marker}",
+                "content": "支持账号密码登录与权限控制",
+                "auto_run": True,
+            },
+        )
+        requirement.raise_for_status()
+        qa_task_id = requirement.json()["agent_task_id"]
+        approved = client.post(f"{base}/agent/tasks/{qa_task_id}/approve")
+        approved.raise_for_status()
+        suites = client.get(f"{base}/qa/test-suites").json()
+        assert suites and suites[0]["cases"]
+        alert = client.post(
+            f"{base}/integrations/alerts",
+            json={
+                "title": f"Smoke 召回率下降 {marker}",
+                "service": "recommendation",
+                "severity": "P1",
+            },
+        )
+        alert.raise_for_status()
+        alert_task_id = alert.json()["agent_task_id"]
+        approved = client.post(f"{base}/agent/tasks/{alert_task_id}/approve")
+        approved.raise_for_status()
+        assert client.get(f"{base}/incidents").json(), "incident record missing"
+        print("PASS write smoke: document, agent, reflow, evaluation, qa loop, alert triage")
     return 0
 
 

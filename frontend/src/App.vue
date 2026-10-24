@@ -3,15 +3,29 @@ import { computed, onMounted, ref } from 'vue'
 import {
   AgentArtifact,
   AgentTask,
+  AlertEvent,
   api,
   EvaluationRun,
+  IncidentRecord,
+  IntegrationEvent,
+  QaRequirement,
+  QaTestSuite,
   Review,
   SearchResponse,
   Stats,
   WikiPage,
 } from './api'
 
-type View = 'overview' | 'knowledge' | 'review' | 'search' | 'agents' | 'evaluation'
+type View =
+  | 'overview'
+  | 'knowledge'
+  | 'review'
+  | 'search'
+  | 'agents'
+  | 'evaluation'
+  | 'integrations'
+  | 'qa'
+  | 'alerts'
 type ReviewDraft = {
   scope: string
   owner: string
@@ -44,6 +58,19 @@ const feishuTitle = ref('')
 const feishuOwner = ref('unknown')
 const feishuCompile = ref(true)
 const expandedTasks = ref<Record<string, boolean>>({})
+const integrationEvents = ref<IntegrationEvent[]>([])
+const qaRequirements = ref<QaRequirement[]>([])
+const qaSuites = ref<QaTestSuite[]>([])
+const alerts = ref<AlertEvent[]>([])
+const incidents = ref<IncidentRecord[]>([])
+const requirementTitle = ref('')
+const requirementContent = ref('')
+const alertTitle = ref('')
+const alertService = ref('')
+const alertSeverity = ref('P2')
+const alertDescription = ref('')
+const suiteReports = ref<Record<string, string>>({})
+const expandedSuites = ref<Record<string, boolean>>({})
 
 const nav = [
   ['overview', '总览', '01'],
@@ -52,6 +79,9 @@ const nav = [
   ['search', '可追溯问答', '04'],
   ['agents', 'Agent Runtime', '05'],
   ['evaluation', '评测实验', '06'],
+  ['integrations', '集成事件', '07'],
+  ['qa', 'QA Studio', '08'],
+  ['alerts', '告警归因', '09'],
 ] as const
 
 const viewTitle = computed(() => nav.find((item) => item[0] === view.value)?.[1] || '')
@@ -85,6 +115,18 @@ async function load() {
     reviews.value = reviewData
     tasks.value = taskData
     evaluationRuns.value = evaluationData
+    const [eventData, requirementData, suiteData, alertData, incidentData] = await Promise.all([
+      api<IntegrationEvent[]>('/integrations/events'),
+      api<QaRequirement[]>('/qa/requirements'),
+      api<QaTestSuite[]>('/qa/test-suites'),
+      api<AlertEvent[]>('/alerts'),
+      api<IncidentRecord[]>('/incidents'),
+    ])
+    integrationEvents.value = eventData
+    qaRequirements.value = requirementData
+    qaSuites.value = suiteData
+    alerts.value = alertData
+    incidents.value = incidentData
     reviewDrafts.value = Object.fromEntries(
       reviewData.map((item) => [
         item.id,
@@ -263,6 +305,77 @@ async function runEvaluation() {
   }, '评测失败')
 }
 
+async function submitRequirement() {
+  if (!requirementTitle.value.trim() || !requirementContent.value.trim()) {
+    error.value = '需求标题和内容不能为空。'
+    return
+  }
+  await perform(async () => {
+    await api('/qa/requirements', {
+      method: 'POST',
+      body: JSON.stringify({
+        title: requirementTitle.value.trim(),
+        content: requirementContent.value.trim(),
+      }),
+    })
+    notice.value = '需求已提交，测试生成任务已创建。'
+    requirementTitle.value = ''
+    requirementContent.value = ''
+    await load()
+  }, '需求提交失败')
+}
+
+async function generateCases(requirement: QaRequirement) {
+  await perform(async () => {
+    await api(`/qa/requirements/${requirement.id}/generate`, { method: 'POST' })
+    notice.value = '测试生成任务已创建，请前往 Agent Runtime 审批中风险步骤。'
+    await load()
+  }, '任务创建失败')
+}
+
+async function toggleSuiteReport(suite: QaTestSuite) {
+  if (suiteReports.value[suite.id]) {
+    delete suiteReports.value[suite.id]
+    return
+  }
+  await perform(async () => {
+    const result = await api<{ markdown: string }>(`/qa/test-suites/${suite.id}/report`, {
+      method: 'POST',
+    })
+    suiteReports.value[suite.id] = result.markdown
+  }, '报告生成失败')
+}
+
+async function submitAlert() {
+  if (!alertTitle.value.trim()) {
+    error.value = '告警标题不能为空。'
+    return
+  }
+  await perform(async () => {
+    await api('/integrations/alerts', {
+      method: 'POST',
+      body: JSON.stringify({
+        title: alertTitle.value.trim(),
+        service: alertService.value.trim() || 'unknown',
+        severity: alertSeverity.value,
+        description: alertDescription.value.trim(),
+      }),
+    })
+    notice.value = '告警已接入并触发归因任务。'
+    alertTitle.value = ''
+    alertDescription.value = ''
+    await load()
+  }, '告警接入失败')
+}
+
+async function triageAlert(alert: AlertEvent) {
+  await perform(async () => {
+    await api(`/alerts/${alert.id}/triage`, { method: 'POST' })
+    notice.value = '归因任务已创建，请前往 Agent Runtime 审批高风险步骤。'
+    await load()
+  }, '归因任务创建失败')
+}
+
 onMounted(load)
 </script>
 
@@ -401,7 +514,84 @@ onMounted(load)
         <div v-if="!tasks.length" class="empty large">暂无 Agent 任务。</div>
       </section>
 
-      <section v-else class="view">
+      <section v-else-if="view === 'integrations'" class="view">
+        <div class="section-head"><span>INTEGRATION GATEWAY</span><h3>外部集成事件</h3><p>飞书消息 / 文档事件经鉴权、去重、标准化后进入 Agent Runtime。</p></div>
+        <article v-for="event in integrationEvents" :key="event.id" class="task-card">
+          <div class="task-head"><span :class="['status', event.status === 'processed' ? 'succeeded' : event.status]">{{ event.status }}</span><time>{{ new Date(event.created_at).toLocaleString() }}</time></div>
+          <h3>{{ event.provider }} / {{ event.event_type }}</h3>
+          <div class="run-metrics"><span>event_id <b>{{ event.event_id || '—' }}</b></span><span v-if="event.agent_task_id">agent_task <b>{{ event.agent_task_id.slice(0, 8) }}</b></span></div>
+          <div v-if="event.error" class="task-error"><p class="error-text">{{ event.error }}</p></div>
+        </article>
+        <div v-if="!integrationEvents.length" class="empty large">暂无集成事件。配置飞书事件订阅后，消息（问答:/用例:/归因:/文档）将在此展示。</div>
+      </section>
+
+      <section v-else-if="view === 'qa'" class="view">
+        <div class="section-head"><span>QA LOOP</span><h3>PRD → 测试点 → 用例 → 报告</h3><p>提交需求后由 Agent Runtime 编排生成，结构化用例可回流入库。</p></div>
+        <form class="ingest-card batch-card" @submit.prevent="submitRequirement">
+          <span class="eyebrow">NEW REQUIREMENT</span><h3>提交需求 / PRD</h3>
+          <label>标题<input v-model="requirementTitle" placeholder="例如：登录功能上线" /></label>
+          <label>需求内容<textarea v-model="requirementContent" rows="6" placeholder="粘贴 PRD 或需求描述"></textarea></label>
+          <button class="primary" :disabled="loading" type="submit">提交并生成用例</button>
+        </form>
+        <article v-for="req in qaRequirements" :key="req.id" class="task-card">
+          <div class="task-head"><span class="eyebrow">REQUIREMENT</span><time>{{ new Date(req.created_at).toLocaleString() }}</time></div>
+          <h3>{{ req.title }}</h3>
+          <footer class="task-actions"><button class="ghost" :disabled="loading" @click="generateCases(req)">重新生成用例</button></footer>
+          <div v-for="suite in qaSuites.filter((s) => s.requirement_id === req.id)" :key="suite.id" class="artifact">
+            <div><strong>{{ suite.name }}</strong><span>{{ suite.status }} · 覆盖 {{ suite.summary.coverage ?? '—' }} · {{ suite.cases.length }} 用例</span></div>
+            <div class="run-metrics"><span v-for="point in suite.testpoints.slice(0, 8)" :key="point.name">[{{ point.priority }}] <b>{{ point.name }}</b></span></div>
+            <footer class="task-actions">
+              <button class="ghost" @click="expandedSuites[suite.id] = !expandedSuites[suite.id]">{{ expandedSuites[suite.id] ? '收起用例' : `查看 ${suite.cases.length} 条用例` }}</button>
+              <button class="ghost" :disabled="loading" @click="toggleSuiteReport(suite)">{{ suiteReports[suite.id] ? '收起报告' : '生成/查看报告' }}</button>
+            </footer>
+            <div v-if="expandedSuites[suite.id]">
+              <article v-for="item in suite.cases" :key="item.id" class="result-card">
+                <small>[{{ item.priority }}] {{ item.name }}</small>
+                <p>前置：{{ item.precondition }}</p>
+                <p>{{ item.steps.map((step, i) => `${i + 1}. ${step}`).join('；') }}</p>
+                <p>预期：{{ item.expected_result }}</p>
+              </article>
+            </div>
+            <pre v-if="suiteReports[suite.id]">{{ suiteReports[suite.id] }}</pre>
+          </div>
+        </article>
+        <div v-if="!qaRequirements.length" class="empty large">暂无需求，提交 PRD 后自动生成测试点与用例。</div>
+      </section>
+
+      <section v-else-if="view === 'alerts'" class="view">
+        <div class="section-head"><span>ALERT TRIAGE</span><h3>告警归因</h3><p>通用 Webhook 接入告警，Agent 结合知识与图谱输出根因假设，事故记录需审批。</p></div>
+        <form class="ingest-card batch-card" @submit.prevent="submitAlert">
+          <span class="eyebrow">SIMULATE WEBHOOK</span><h3>模拟告警接入</h3>
+          <label>标题<input v-model="alertTitle" placeholder="例如：推荐服务召回率下降" /></label>
+          <label>服务<input v-model="alertService" placeholder="recommendation" /></label>
+          <label>级别<select v-model="alertSeverity"><option>P0</option><option>P1</option><option>P2</option><option>P3</option></select></label>
+          <label>描述<textarea v-model="alertDescription" rows="3"></textarea></label>
+          <button class="primary" :disabled="loading" type="submit">接入并归因</button>
+        </form>
+        <article v-for="alert in alerts" :key="alert.id" class="task-card">
+          <div class="task-head"><span :class="['status', alert.status === 'recorded' ? 'succeeded' : 'running']">{{ alert.severity }} · {{ alert.status }}</span><time>{{ new Date(alert.created_at).toLocaleString() }}</time></div>
+          <h3>{{ alert.title }}</h3>
+          <div class="run-metrics"><span>service <b>{{ alert.service }}</b></span><span>occurrences <b>{{ alert.occurrence_count }}</b></span></div>
+          <div v-if="alert.triage && alert.triage.hypotheses" class="source-context">
+            <div><small>根因假设</small><p v-for="(h, i) in alert.triage.hypotheses" :key="i">· {{ h.cause }}（{{ h.evidence }}）</p></div>
+            <div><small>不确定性</small><p>{{ alert.triage.uncertainty }}</p></div>
+          </div>
+          <footer class="task-actions"><button class="ghost" :disabled="loading" @click="triageAlert(alert)">{{ alert.agent_task_id ? '查看/重新归因' : '触发归因' }}</button></footer>
+        </article>
+        <div class="section-head history-head"><span>INCIDENTS</span><h3>事故记录 · {{ incidents.length }}</h3></div>
+        <article v-for="incident in incidents" :key="incident.id" class="task-card">
+          <div class="task-head"><span class="status succeeded">{{ incident.severity }}</span><time>{{ new Date(incident.created_at).toLocaleString() }}</time></div>
+          <h3>{{ incident.title }}</h3>
+          <p>{{ incident.summary }}</p>
+          <div class="source-context">
+            <div><small>根因假设</small><p>{{ incident.root_cause_hypothesis }}</p></div>
+            <div><small>建议动作</small><p v-for="(action, i) in incident.recommended_actions" :key="i">· {{ action }}</p></div>
+          </div>
+        </article>
+        <div v-if="!alerts.length" class="empty large">暂无告警。可通过 POST /integrations/alerts Webhook 接入监控平台。</div>
+      </section>
+
+      <section v-else-if="view === 'evaluation'" class="view">
         <div class="evaluation-hero"><span class="eyebrow">DETERMINISTIC FIRST</span><h2>商家任务分层评测</h2><p>覆盖主体审核、品牌授权、退入驻、CRM、发券与 Agent 工具调用，跟踪 wiki_hit、rag_no_hit、p95_latency_ms 与 pass_rate。</p><button class="primary" :disabled="loading" @click="runEvaluation">运行 Benchmark</button></div>
         <div v-if="runMetrics" class="metrics eval"><article v-for="(value, key) in runMetrics" :key="key"><span>{{ key }}</span><strong>{{ formatMetric(value) }}</strong></article></div>
         <div class="section-head history-head"><span>RUN HISTORY</span><h3>历史运行 · {{ evaluationRuns.length }}</h3></div>

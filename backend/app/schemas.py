@@ -223,3 +223,101 @@ class DashboardStats(BaseModel):
     pending_reviews: int
     agent_tasks: int
     evaluation_runs: int
+
+
+class IntegrationEventRead(ORMModel):
+    id: str
+    provider: str
+    event_id: Optional[str]
+    event_type: str
+    dedupe_key: str
+    status: str
+    agent_task_id: Optional[str]
+    error: Optional[str]
+    created_at: datetime
+    processed_at: Optional[datetime]
+
+
+class QaRequirementCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    content: str = Field(min_length=1)
+    source_document_id: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    auto_run: bool = True
+
+
+class QaRequirementRead(ORMModel):
+    id: str
+    title: str
+    content: str
+    source_document_id: Optional[str]
+    parsed: dict[str, Any]
+    metadata_json: dict[str, Any]
+    created_at: datetime
+
+
+class QaTestCaseRead(ORMModel):
+    id: str
+    suite_id: str
+    name: str
+    precondition: str
+    steps: list[Any]
+    expected_result: str
+    priority: str
+    status: str
+    created_at: datetime
+
+
+class QaTestSuiteRead(ORMModel):
+    id: str
+    requirement_id: str
+    task_id: Optional[str]
+    name: str
+    status: str
+    summary: dict[str, Any]
+    testpoints: list[Any]
+    created_at: datetime
+    cases: list[QaTestCaseRead] = Field(default_factory=list)
+
+
+class AlertWebhook(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    source: str = Field(default="webhook", max_length=60)
+    service: str = Field(default="unknown", max_length=200)
+    severity: str = Field(default="P3", max_length=20)
+    description: str = ""
+    labels: dict[str, Any] = Field(default_factory=dict)
+    fingerprint: Optional[str] = Field(default=None, max_length=300)
+    auto_triage: bool = True
+
+
+class AlertEventRead(ORMModel):
+    id: str
+    fingerprint: str
+    source: str
+    title: str
+    service: str
+    severity: str
+    status: str
+    description: str
+    labels: dict[str, Any]
+    triage: dict[str, Any]
+    occurrence_count: int
+    agent_task_id: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+
+
+class IncidentRecordRead(ORMModel):
+    id: str
+    alert_id: str
+    task_id: Optional[str]
+    title: str
+    severity: str
+    status: str
+    summary: str
+    root_cause_hypothesis: str
+    impact: str
+    recommended_actions: list[Any]
+    references: dict[str, Any]
+    created_at: datetime

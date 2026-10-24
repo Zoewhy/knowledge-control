@@ -313,3 +313,116 @@ class EvaluationResult(Base):
     answer: Mapped[str] = mapped_column(Text, default="")
     trace: Mapped[dict] = mapped_column(JSON, default=dict)
     run: Mapped[EvaluationRun] = relationship(back_populates="results")
+
+
+class IntegrationEvent(Base):
+    __tablename__ = "integration_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    provider: Mapped[str] = mapped_column(String(40), default="feishu", index=True)
+    event_id: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(120), default="unknown")
+    dedupe_key: Mapped[str] = mapped_column(String(300), unique=True, index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(40), default="received", index=True)
+    agent_task_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("agent_tasks.id"), nullable=True, index=True
+    )
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    processed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class QaRequirement(Base):
+    __tablename__ = "qa_requirements"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    title: Mapped[str] = mapped_column(String(300), index=True)
+    content: Mapped[str] = mapped_column(Text)
+    source_document_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("source_documents.id"), nullable=True
+    )
+    parsed: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    suites: Mapped[list["QaTestSuite"]] = relationship(
+        back_populates="requirement", cascade="all, delete-orphan"
+    )
+
+
+class QaTestSuite(Base):
+    __tablename__ = "qa_test_suites"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    requirement_id: Mapped[str] = mapped_column(ForeignKey("qa_requirements.id"), index=True)
+    task_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("agent_tasks.id"), nullable=True, index=True
+    )
+    name: Mapped[str] = mapped_column(String(300))
+    status: Mapped[str] = mapped_column(String(40), default="generated")
+    summary: Mapped[dict] = mapped_column(JSON, default=dict)
+    testpoints: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    requirement: Mapped[QaRequirement] = relationship(back_populates="suites")
+    cases: Mapped[list["QaTestCase"]] = relationship(
+        back_populates="suite", cascade="all, delete-orphan"
+    )
+
+
+class QaTestCase(Base):
+    __tablename__ = "qa_test_cases"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    suite_id: Mapped[str] = mapped_column(ForeignKey("qa_test_suites.id"), index=True)
+    name: Mapped[str] = mapped_column(String(300))
+    precondition: Mapped[str] = mapped_column(Text, default="")
+    steps: Mapped[list] = mapped_column(JSON, default=list)
+    expected_result: Mapped[str] = mapped_column(Text, default="")
+    priority: Mapped[str] = mapped_column(String(10), default="P2")
+    status: Mapped[str] = mapped_column(String(40), default="draft")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    suite: Mapped[QaTestSuite] = relationship(back_populates="cases")
+
+
+class AlertEvent(Base):
+    __tablename__ = "alert_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    fingerprint: Mapped[str] = mapped_column(String(300), unique=True, index=True)
+    source: Mapped[str] = mapped_column(String(60), default="webhook")
+    title: Mapped[str] = mapped_column(String(300), index=True)
+    service: Mapped[str] = mapped_column(String(200), default="unknown", index=True)
+    severity: Mapped[str] = mapped_column(String(20), default="P3")
+    status: Mapped[str] = mapped_column(String(40), default="firing", index=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    labels: Mapped[dict] = mapped_column(JSON, default=dict)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    triage: Mapped[dict] = mapped_column(JSON, default=dict)
+    occurrence_count: Mapped[int] = mapped_column(Integer, default=1)
+    agent_task_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("agent_tasks.id"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    incidents: Mapped[list["IncidentRecord"]] = relationship(back_populates="alert")
+
+
+class IncidentRecord(Base):
+    __tablename__ = "incident_records"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    alert_id: Mapped[str] = mapped_column(ForeignKey("alert_events.id"), index=True)
+    task_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("agent_tasks.id"), nullable=True, index=True
+    )
+    title: Mapped[str] = mapped_column(String(300))
+    severity: Mapped[str] = mapped_column(String(20), default="P3")
+    status: Mapped[str] = mapped_column(String(40), default="open")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    root_cause_hypothesis: Mapped[str] = mapped_column(Text, default="")
+    impact: Mapped[str] = mapped_column(Text, default="")
+    recommended_actions: Mapped[list] = mapped_column(JSON, default=list)
+    references: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    alert: Mapped[AlertEvent] = relationship(back_populates="incidents")
