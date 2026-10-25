@@ -325,7 +325,7 @@ class Neo4jGraphStore:
 
     def query_paths(self, db: Session, query: str, limit: int) -> list[dict]:
         records = self._run(
-            "MATCH (e:Entity) WHERE $query CONTAINS e.normalized_name "
+            "MATCH (e:Entity) WHERE $q CONTAINS e.normalized_name "
             "WITH collect(e) AS matched "
             "UNWIND matched AS m "
             "MATCH (m)-[r:CO_OCCURS]-(other:Entity) "
@@ -335,7 +335,7 @@ class Neo4jGraphStore:
             "WHERE size(sections) >= 2 "
             "RETURN a.name AS from_name, b.name AS to_name, r.claim_id AS claim_id, sections "
             "LIMIT $limit",
-            query=normalize_entity(query),
+            q=normalize_entity(query),
             limit=limit,
         )
         return [

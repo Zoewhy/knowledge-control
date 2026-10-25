@@ -118,7 +118,7 @@ def test_neo4j_query_paths_maps_records():
     paths = store.query_paths(None, "MySQL 与 Elasticsearch 关系", limit=10)
     cypher, params = driver.calls[0]
     assert "CONTAINS e.normalized_name" in cypher
-    assert params["query"] == "mysql与elasticsearch关系"
+    assert params["q"] == "mysql与elasticsearch关系"
     assert paths[0]["steps"][0]["from"] == "MySQL"
     assert paths[0]["steps"][0]["claim_id"] == "claim-1"
     assert len(paths[0]["sections"]) == 2
