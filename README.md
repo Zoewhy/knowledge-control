@@ -10,7 +10,7 @@
 - Review 工作台：来源 Claim、原文片段、目标 Wiki 聚合，支持修改 Scope、Owner、拟合并内容和目标 Section
 - Wiki-first 并行混合检索：Wiki 词法/向量、Source 词法/向量、Elasticsearch BM25、每分支超时与降级诊断
 - 持久化实体关系 GraphRAG：生产环境写入 Neo4j（`Entity` / `Section` / `CO_OCCURS` 关系），本地未配置时降级为 SQL 共现图；支持跨 WikiPage/Document 路径扩展和 `graph_query`
-- Agent Runtime：Celery 调度、计划校验、工具/action 白名单、风险审批、step 幂等、事件、结构化失败诊断、恢复、replay 和产物回流
+- Agent Runtime：LangGraph `StateGraph` 编排确定性计划（审批门/幂等/恢复），Celery 调度、计划校验、工具/action 白名单、风险审批、step 幂等、事件、结构化失败诊断、恢复、replay 和产物回流
 - Integration Gateway：飞书事件订阅（URL 验证、token 校验、事件幂等去重），消息指令路由（`文档 <token>` / `问答:` / `用例:` / `归因:`）到知识接入、问答、测试生成和告警归因任务
 - QA 测试闭环：`prd_parse → knowledge_search → testpoint_generate → testcase_generate → coverage_review → report_generate`，结构化用例入库（`QaRequirement / QaTestSuite / QaTestCase`），Markdown 报告产物可回流知识库
 - 告警归因：通用告警 Webhook（fingerprint 幂等、重复告警合并计数）、`alert_context_collect → knowledge_search → graph_query → incident_hypothesis_generate → incident_record_create` 归因链，高风险事故记录创建需人工审批，输出仅包含根因假设与不确定性说明
@@ -19,11 +19,11 @@
 
 ## 技术栈
 
-FastAPI、Pydantic、SQLAlchemy/Alembic、PolarDB PostgreSQL/pgvector、Elasticsearch、Neo4j（GraphRAG 图存储）、Redis/Celery、Vue 3、OpenAI-compatible Gateway（阿里云百炼）。PolarDB PostgreSQL 与社区 PostgreSQL 协议兼容，本地快速模式使用 SQLite 和确定性 mock；生产容器使用 PostgreSQL（可替换为 PolarDB 连接串）、Elasticsearch、Neo4j、Redis 和 Celery 异步执行。
+FastAPI、Pydantic、SQLAlchemy/Alembic、PolarDB PostgreSQL/pgvector、Elasticsearch、Neo4j（GraphRAG 图存储）、Redis/Celery、LangChain（Chat/Embedding、文档切分、RAG 链）、LangGraph（Agent Runtime）、Vue 3、OpenAI-compatible Gateway（阿里云百炼）。PolarDB PostgreSQL 与社区 PostgreSQL 协议兼容，本地快速模式使用 SQLite 和确定性 mock；生产容器使用 PostgreSQL（可替换为 PolarDB 连接串）、Elasticsearch、Neo4j、Redis 和 Celery 异步执行。
 
 ## 快速启动（本地轻量模式）
 
-需要 Python 3.9+ 与 Node.js 20+。
+需要 Python 3.10+ 与 Node.js 20+。
 
 ```bash
 cp .env.example .env

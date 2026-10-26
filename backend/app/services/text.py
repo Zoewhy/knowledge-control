@@ -5,6 +5,11 @@ import math
 import re
 from collections import Counter
 
+from langchain_text_splitters import (
+    MarkdownHeaderTextSplitter,
+    RecursiveCharacterTextSplitter,
+)
+
 
 def fingerprint(text: str) -> str:
     normalized = re.sub(r"\s+", " ", text.strip().lower())
@@ -37,27 +42,45 @@ def lexical_score(query: str, content: str) -> float:
     return round(overlap / norm, 6) if norm else 0.0
 
 
+_MARKDOWN_HEADERS = [
+    ("#", "h1"),
+    ("##", "h2"),
+    ("###", "h3"),
+    ("####", "h4"),
+    ("#####", "h5"),
+    ("######", "h6"),
+]
+
+
+def _deepest_heading(metadata: dict) -> str | None:
+    for level in ("h6", "h5", "h4", "h3", "h2", "h1"):
+        value = metadata.get(level)
+        if value:
+            return value.strip() or None
+    return None
+
+
 def split_markdown(content: str, max_chars: int = 1800) -> list[tuple[str | None, str]]:
+    """按 Markdown 标题切分（LangChain splitter），超长段落再做二次切分。"""
+    header_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=_MARKDOWN_HEADERS)
+    length_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=max_chars,
+        chunk_overlap=0,
+        separators=["\n\n", "\n", "。", " ", ""],
+    )
     blocks: list[tuple[str | None, str]] = []
-    heading: str | None = None
-    buffer: list[str] = []
-
-    def flush() -> None:
-        nonlocal buffer
-        text = "\n".join(buffer).strip()
-        if text:
-            blocks.append((heading, text))
-        buffer = []
-
-    for line in content.splitlines():
-        if re.match(r"^#{1,6}\s+", line):
-            flush()
-            heading = re.sub(r"^#{1,6}\s+", "", line).strip()
+    for document in header_splitter.split_text(content):
+        heading = _deepest_heading(document.metadata)
+        text = document.page_content.strip()
+        if not text:
             continue
-        if sum(len(item) for item in buffer) + len(line) > max_chars:
-            flush()
-        buffer.append(line)
-    flush()
+        if len(text) <= max_chars:
+            blocks.append((heading, text))
+            continue
+        for chunk in length_splitter.split_text(text):
+            chunk = chunk.strip()
+            if chunk:
+                blocks.append((heading, chunk))
     return blocks or [(None, content.strip())]
 
 

@@ -5,7 +5,7 @@ from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
-from ..models import AgentArtifact, AgentEvent, AgentTask, TaskStatus, ToolCallRecord, utcnow
+from ..models import AgentArtifact, AgentEvent, AgentTask, ToolCallRecord
 from .alert_tools import (
     alert_context_collect,
     feishu_notify,
@@ -370,83 +370,7 @@ def _save_artifact(db: Session, task: AgentTask, record: ToolCallRecord, output:
 
 
 def execute_task(db: Session, task: AgentTask, approve_medium_risk: bool = False) -> AgentTask:
-    registry.validate_plan(task.plan)
-    task.status = TaskStatus.running
-    task.error = None
-    task.error_detail = {}
-    _event(db, task, "task_started", {"resume_from": task.step_index})
-    db.commit()
-    outputs: list[dict[str, Any]] = []
-    current_step = task.step_index
-    current_tool = None
-    current_record: ToolCallRecord | None = None
-    try:
-        while task.step_index < len(task.plan):
-            current_step = task.step_index
-            step = task.plan[task.step_index]
-            tool = registry.get(step["tool"])
-            current_tool = tool.name
-            existing = next(
-                (
-                    call
-                    for call in task.tool_calls
-                    if call.step_index == task.step_index and call.status == "succeeded"
-                ),
-                None,
-            )
-            if existing:
-                outputs.append(existing.output)
-                task.step_index += 1
-                _event(db, task, "step_skipped", {"tool": tool.name}, current_step)
-                db.commit()
-                continue
-            if tool.risk_level in {"medium", "high"} and not approve_medium_risk:
-                task.status = TaskStatus.waiting_approval
-                _event(db, task, "approval_required", {"tool": tool.name}, current_step)
-                db.commit()
-                return task
-            record = ToolCallRecord(
-                task_id=task.id,
-                step_index=task.step_index,
-                tool_name=tool.name,
-                arguments={**step.get("arguments", {}), "task_id": task.id},
-                risk_level=tool.risk_level,
-                status="running",
-            )
-            current_record = record
-            db.add(record)
-            db.flush()
-            _event(db, task, "step_started", {"tool": tool.name}, current_step)
-            db.commit()
-            output = tool.handler(db, record.arguments)
-            record.output = output
-            record.status = "succeeded"
-            record.ended_at = utcnow()
-            outputs.append(output)
-            _save_artifact(db, task, record, output)
-            task.step_index += 1
-            _event(db, task, "step_succeeded", {"tool": tool.name}, current_step)
-            db.commit()
-        task.result = {"steps": outputs, "final": outputs[-1] if outputs else {}}
-        task.status = TaskStatus.succeeded
-        task.error = None
-        task.error_detail = {}
-        _event(db, task, "task_succeeded", {"steps": len(outputs)})
-    except Exception as exc:
-        task.status = TaskStatus.failed
-        task.error = str(exc)
-        task.error_detail = {
-            "type": type(exc).__name__,
-            "message": str(exc),
-            "step_index": current_step,
-            "tool": current_tool,
-            "retryable": True,
-        }
-        if current_record is not None and current_record.status == "running":
-            current_record.status = "failed"
-            current_record.ended_at = utcnow()
-            current_record.output = task.error_detail
-        _event(db, task, "task_failed", task.error_detail, current_step)
-    db.commit()
-    db.refresh(task)
-    return task
+    """执行任务计划：委托 LangGraph 编排层，保留原有审批/幂等/事件语义。"""
+    from .agent_graph import run_plan
+
+    return run_plan(db, task, approve_medium_risk=approve_medium_risk)
