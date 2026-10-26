@@ -25,6 +25,18 @@ export type Stats = {
   evaluation_runs: number
 }
 
+export type KnowledgeDocument = {
+  id: string
+  title: string
+  source_type: string
+  owner: string
+  status: string
+  progress: number
+  error_message?: string | null
+  created_at: string
+  segments?: Array<{ id: string; heading?: string | null; segment_type: string }>
+}
+
 export type Review = {
   id: string
   claim_id: string

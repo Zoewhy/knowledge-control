@@ -43,6 +43,9 @@ class SegmentRead(ORMModel):
     id: str
     ordinal: int
     heading: Optional[str]
+    heading_path: list[str] = Field(default_factory=list)
+    segment_type: str = "text"
+    token_count: int = 0
     content: str
     claims: list[ClaimRead] = Field(default_factory=list)
 
@@ -54,8 +57,19 @@ class DocumentRead(ORMModel):
     source_uri: Optional[str]
     owner: str
     status: str
+    progress: int = 0
+    error_message: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict, validation_alias="metadata_json")
     created_at: datetime
     segments: list[SegmentRead] = Field(default_factory=list)
+
+
+class DocumentStatusRead(ORMModel):
+    id: str
+    title: str
+    status: str
+    progress: int
+    error_message: Optional[str] = None
 
 
 class CitationRead(BaseModel):

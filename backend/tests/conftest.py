@@ -4,13 +4,15 @@ os.environ["DATABASE_URL"] = "sqlite:///./test_alg_qa.db"
 os.environ["LLM_MOCK_MODE"] = "true"
 
 import pytest
+from app.config import settings
 from app.database import Base, engine
 from app.main import app
 from fastapi.testclient import TestClient
 
 
 @pytest.fixture(autouse=True)
-def clean_database():
+def clean_database(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "upload_dir", str(tmp_path / "files"))
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     yield

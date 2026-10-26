@@ -2,13 +2,54 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import re
 from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
 
 from langchain_text_splitters import (
     MarkdownHeaderTextSplitter,
     RecursiveCharacterTextSplitter,
 )
+
+_CL100K_BLOB_URL = "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
+_ENCODING = None
+
+
+def _encoding():
+    """加载 cl100k_base；优先使用仓库内置的离线 BPE 资产，避免运行时联网下载。"""
+    global _ENCODING
+    if _ENCODING is not None:
+        return _ENCODING
+    import tiktoken
+
+    if not os.environ.get("TIKTOKEN_CACHE_DIR"):
+        source = Path(__file__).resolve().parents[1] / "assets" / "cl100k_base.tiktoken"
+        if source.exists():
+            import shutil
+            import tempfile
+
+            cache_dir = Path(tempfile.gettempdir()) / "alg_qa_tiktoken"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_key = hashlib.sha1(_CL100K_BLOB_URL.encode()).hexdigest()
+            cached = cache_dir / cache_key
+            if not cached.exists():
+                shutil.copyfile(source, cached)
+            os.environ["TIKTOKEN_CACHE_DIR"] = str(cache_dir)
+    _ENCODING = tiktoken.get_encoding("cl100k_base")
+    return _ENCODING
+
+
+def count_tokens(text: str) -> int:
+    """真实 token 数（cl100k_base）；资产缺失时退化为字符近似，保证管线不中断。"""
+    if not text:
+        return 0
+    try:
+        return len(_encoding().encode(text))
+    except Exception:
+        return max(1, len(text) // 2)
 
 
 def fingerprint(text: str) -> str:
@@ -42,7 +83,7 @@ def lexical_score(query: str, content: str) -> float:
     return round(overlap / norm, 6) if norm else 0.0
 
 
-_MARKDOWN_HEADERS = [
+MARKDOWN_HEADERS = [
     ("#", "h1"),
     ("##", "h2"),
     ("###", "h3"),
@@ -60,28 +101,67 @@ def _deepest_heading(metadata: dict) -> str | None:
     return None
 
 
-def split_markdown(content: str, max_chars: int = 1800) -> list[tuple[str | None, str]]:
-    """按 Markdown 标题切分（LangChain splitter），超长段落再做二次切分。"""
-    header_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=_MARKDOWN_HEADERS)
-    length_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=max_chars,
-        chunk_overlap=0,
+def heading_path_from(metadata: dict) -> list[str]:
+    return [metadata[key].strip() for _, key in MARKDOWN_HEADERS if metadata.get(key)]
+
+
+@dataclass
+class SegmentDraft:
+    heading: Optional[str] = None
+    heading_path: list[str] = field(default_factory=list)
+    content: str = ""
+    segment_type: str = "text"
+
+
+def split_text_block(
+    content: str,
+    heading_path: list[str] | None = None,
+    max_tokens: int = 512,
+    overlap_tokens: int = 50,
+) -> list[SegmentDraft]:
+    """普通文本块按 token 数二次切分（512 token / 50 token overlap）。"""
+    heading_path = list(heading_path or [])
+    heading = heading_path[-1] if heading_path else None
+    text = content.strip()
+    if not text:
+        return []
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=max_tokens,
+        chunk_overlap=overlap_tokens,
+        length_function=count_tokens,
         separators=["\n\n", "\n", "。", " ", ""],
     )
-    blocks: list[tuple[str | None, str]] = []
+    chunks = [text] if count_tokens(text) <= max_tokens else splitter.split_text(text)
+    return [
+        SegmentDraft(heading=heading, heading_path=heading_path, content=chunk.strip())
+        for chunk in chunks
+        if chunk.strip()
+    ]
+
+
+def split_markdown(
+    content: str, max_tokens: int = 512, overlap_tokens: int = 50
+) -> list[SegmentDraft]:
+    """按 Markdown 标题切分（保留标题路径），超长段落再按 token 二次切分。"""
+    header_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=MARKDOWN_HEADERS)
+    drafts: list[SegmentDraft] = []
     for document in header_splitter.split_text(content):
-        heading = _deepest_heading(document.metadata)
-        text = document.page_content.strip()
-        if not text:
-            continue
-        if len(text) <= max_chars:
-            blocks.append((heading, text))
-            continue
-        for chunk in length_splitter.split_text(text):
-            chunk = chunk.strip()
-            if chunk:
-                blocks.append((heading, chunk))
-    return blocks or [(None, content.strip())]
+        heading_path = heading_path_from(document.metadata)
+        drafts.extend(
+            split_text_block(document.page_content, heading_path, max_tokens, overlap_tokens)
+        )
+    return drafts or [SegmentDraft(content=content.strip())]
+
+
+def table_to_markdown(headers: list[str], rows: list[list[str]]) -> str:
+    def line(cells: list[str]) -> str:
+        cells = [cell.replace("|", "\\|").replace("\n", " ") for cell in cells]
+        return "| " + " | ".join(cells) + " |"
+
+    header_line = line(headers)
+    separator = "| " + " | ".join("---" for _ in headers) + " |"
+    body = [line(row) for row in rows]
+    return "\n".join([header_line, separator, *body])
 
 
 def sentence_claims(content: str) -> list[str]:

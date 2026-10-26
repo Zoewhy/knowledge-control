@@ -5,7 +5,10 @@
 ## 已实现
 
 - `SourceDocument → SourceSegment → SourceClaim → WikiPage / WikiSection` 分层知识模型
-- Markdown/手工内容、文件上传、批量导入、飞书文档导入和历史 `KnowledgeItem + Chunk` 回填
+- 多模态入库链路：Markdown/TXT、PDF（PyMuPDF 文本/表格提取，扫描页渲染成图片走 VL 描述）、DOCX（Heading 层级重建）、XLSX（表头+行转 Markdown 表格）、PNG/JPG（VL 图片描述）统一解析为保序块序列；filetype 嗅探真实 MIME（伪造扩展名 422），原文按 sha256 分目录落盘（`DocumentFile`）
+- 入库状态机：`pending → parsing → chunking → extracting → indexing → compiling → processed`，每步幂等可断点续跑，失败置 `failed + error_message`，支持 `GET /documents/{id}/status` 查询进度与 `POST /documents/{id}/retry` 重试；`INGEST_EXECUTION_MODE=celery` 时投递 Celery 异步执行
+- 切分升级：tiktoken（cl100k_base，内置离线 BPE 资产）真实 token 计数，512 token / 50 overlap 二次切分，segment 保留 `heading_path` 与 `segment_type`（text/table/image），表格整块成段不拆
+- 手工内容、批量导入、飞书文档导入和历史 `KnowledgeItem + Chunk` 回填保持同步入库不变
 - Wiki 编译：新建页面、增量合并、新增 Section、重复内容仅补来源、高风险变更进入 Review Gate
 - Review 工作台：来源 Claim、原文片段、目标 Wiki 聚合，支持修改 Scope、Owner、拟合并内容和目标 Section
 - Wiki-first 并行混合检索：Wiki 词法/向量、Source 词法/向量、Elasticsearch BM25、每分支超时与降级诊断
@@ -19,7 +22,7 @@
 
 ## 技术栈
 
-FastAPI、Pydantic、SQLAlchemy/Alembic、PolarDB PostgreSQL/pgvector、Elasticsearch、Neo4j（GraphRAG 图存储）、Redis/Celery、LangChain（Chat/Embedding、文档切分、RAG 链）、LangGraph（Agent Runtime）、Vue 3、OpenAI-compatible Gateway（阿里云百炼）。PolarDB PostgreSQL 与社区 PostgreSQL 协议兼容，本地快速模式使用 SQLite 和确定性 mock；生产容器使用 PostgreSQL（可替换为 PolarDB 连接串）、Elasticsearch、Neo4j、Redis 和 Celery 异步执行。
+FastAPI、Pydantic、SQLAlchemy/Alembic、PolarDB PostgreSQL/pgvector、Elasticsearch、Neo4j（GraphRAG 图存储）、Redis/Celery、LangChain（Chat/Embedding、文档切分、RAG 链）、LangGraph（Agent Runtime）、PyMuPDF / python-docx / openpyxl（多格式解析）、tiktoken（token 计数）、Vue 3、OpenAI-compatible Gateway（阿里云百炼，含 qwen-vl-plus 视觉模型）。PolarDB PostgreSQL 与社区 PostgreSQL 协议兼容，本地快速模式使用 SQLite 和确定性 mock；生产容器使用 PostgreSQL（可替换为 PolarDB 连接串）、Elasticsearch、Neo4j、Redis 和 Celery 异步执行。
 
 ## 快速启动（本地轻量模式）
 
@@ -59,6 +62,10 @@ LLM_MOCK_MODE=false
 ENABLE_ELASTICSEARCH=false
 ENABLE_NEO4J=false
 AGENT_EXECUTION_MODE=sync
+INGEST_EXECUTION_MODE=sync
+UPLOAD_DIR=data/files
+UPLOAD_MAX_MB=20
+BAILIAN_VL_MODEL=qwen-vl-plus
 ```
 
 图存储默认使用 SQL 共现图（零外部依赖）。配置 `ENABLE_NEO4J=true` 及 `NEO4J_URI/NEO4J_USER/NEO4J_PASSWORD` 后切换到 Neo4j；Neo4j 不可达时自动降级回 SQL 图。生产数据库将 `DATABASE_URL` 指向 PolarDB PostgreSQL 连接串即可，驱动与 SQL 方言完全兼容。
@@ -112,11 +119,15 @@ PYTHONPATH=backend python -m app.scripts.backfill_legacy --rebuild-only
 
 ## API 示例
 
-上传 Markdown：
+上传文件（Markdown / TXT / PDF / DOCX / XLSX / PNG / JPG，≤20MB）：
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/documents/upload \
-  -F 'file=@rules.md' -F 'owner=算法质量' -F 'compile=true'
+  -F 'file=@rules.pdf' -F 'owner=算法质量' -F 'compile=true'
+
+# 查询入库进度 / 失败重试
+curl http://localhost:8000/api/v1/documents/{document_id}/status
+curl -X POST http://localhost:8000/api/v1/documents/{document_id}/retry
 ```
 
 可追溯问答：

@@ -65,6 +65,11 @@ class SourceDocument(Base):
     owner: Mapped[str] = mapped_column(String(120), default="unknown")
     checksum: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     status: Mapped[str] = mapped_column(String(40), default="processed")
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    progress: Mapped[int] = mapped_column(Integer, default=0)
+    file_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("document_files.id"), nullable=True
+    )
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -73,6 +78,26 @@ class SourceDocument(Base):
     segments: Mapped[list["SourceSegment"]] = relationship(
         back_populates="document", cascade="all, delete-orphan"
     )
+    # source_documents/documents_files 互相引用，file 作为只读视图走 DocumentFile.document_id
+    file: Mapped[Optional["DocumentFile"]] = relationship(
+        "DocumentFile",
+        primaryjoin="SourceDocument.id == foreign(DocumentFile.document_id)",
+        viewonly=True,
+        uselist=False,
+    )
+
+
+class DocumentFile(Base):
+    __tablename__ = "document_files"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    document_id: Mapped[str] = mapped_column(ForeignKey("source_documents.id"), index=True)
+    filename: Mapped[str] = mapped_column(String(300))
+    mime: Mapped[str] = mapped_column(String(120))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    storage_path: Mapped[str] = mapped_column(String(1000))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    document: Mapped[SourceDocument] = relationship(foreign_keys=[document_id])
 
 
 class SourceSegment(Base):
@@ -81,6 +106,8 @@ class SourceSegment(Base):
     document_id: Mapped[str] = mapped_column(ForeignKey("source_documents.id"), index=True)
     ordinal: Mapped[int] = mapped_column(Integer)
     heading: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
+    heading_path: Mapped[list] = mapped_column(JSON, default=list)
+    segment_type: Mapped[str] = mapped_column(String(20), default="text")
     content: Mapped[str] = mapped_column(Text)
     token_count: Mapped[int] = mapped_column(Integer, default=0)
     embedding: Mapped[Optional[list]] = mapped_column(EmbeddingType, nullable=True)

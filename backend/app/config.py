@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     bailian_api_key: str = ""
     bailian_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     bailian_chat_model: str = "qwen-plus"
+    bailian_vl_model: str = "qwen-vl-plus"
     bailian_embedding_model: str = "text-embedding-v3"
     bailian_embedding_dimensions: int = 1024
     llm_mock_mode: bool = True
@@ -31,6 +32,9 @@ class Settings(BaseSettings):
     retrieval_max_workers: int = 5
     wiki_fallback_score: float = 0.42
     agent_execution_mode: str = "sync"
+    ingest_execution_mode: str = "sync"
+    upload_dir: str = "data/files"
+    upload_max_mb: int = 20
     feishu_app_id: str = ""
     feishu_app_secret: str = ""
     feishu_base_url: str = "https://open.feishu.cn/open-apis"

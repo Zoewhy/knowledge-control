@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from pathlib import Path
 from typing import Any, Optional
 
+import filetype
 from fastapi import (
     APIRouter,
     Depends,
@@ -24,6 +27,7 @@ from .models import (
     AgentEvent,
     AgentTask,
     AlertEvent,
+    DocumentFile,
     EvaluationCase,
     EvaluationRun,
     IncidentRecord,
@@ -49,6 +53,7 @@ from .schemas import (
     DocumentBatchCreate,
     DocumentCreate,
     DocumentRead,
+    DocumentStatusRead,
     EvaluationArmSummary,
     EvaluationCaseCreate,
     EvaluationCompareResponse,
@@ -70,7 +75,12 @@ from .services.agent_runtime import create_task, registry
 from .services.compiler import compile_claims, decide_review
 from .services.evaluation import run_evaluation
 from .services.feishu import FeishuError, feishu_client
-from .services.ingestion import compile_document, ingest_document
+from .services.ingestion import (
+    compile_document,
+    dispatch_ingest,
+    ingest_document,
+    store_upload,
+)
 from .services.integrations import (
     IntegrationError,
     create_alert_triage_task,
@@ -129,6 +139,35 @@ def create_document(payload: DocumentCreate, db: Session = Depends(get_db)):
     return db.scalar(_document_query(document.id))
 
 
+ALLOWED_UPLOAD_TYPES = {
+    ".md": "text/markdown",
+    ".markdown": "text/markdown",
+    ".txt": "text/plain",
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
+
+
+def _sniff_upload_mime(filename: str, raw: bytes) -> str:
+    expected = ALLOWED_UPLOAD_TYPES[Path(filename).suffix.lower()]
+    detected = filetype.guess(raw)
+    if detected is None:
+        if expected in ("text/markdown", "text/plain"):
+            try:
+                raw.decode("utf-8-sig")
+            except UnicodeDecodeError as exc:
+                raise HTTPException(422, "文本文件必须使用 UTF-8 编码") from exc
+            return expected
+        raise HTTPException(422, "无法识别文件真实类型")
+    if detected.mime != expected:
+        raise HTTPException(422, f"文件内容与扩展名不符：声明 {expected}，实际 {detected.mime}")
+    return expected
+
+
 @router.post("/documents/upload", response_model=DocumentRead, status_code=status.HTTP_201_CREATED)
 async def upload_document(
     file: UploadFile = File(...),
@@ -137,29 +176,69 @@ async def upload_document(
     compile: bool = Form(True),
     db: Session = Depends(get_db),
 ):
-    if not file.filename or not file.filename.lower().endswith((".md", ".markdown", ".txt")):
-        raise HTTPException(415, "仅支持 Markdown 或 UTF-8 文本文件")
-    raw = await file.read(5 * 1024 * 1024 + 1)
-    if len(raw) > 5 * 1024 * 1024:
-        raise HTTPException(413, "文件不能超过 5 MB")
-    try:
-        content = raw.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise HTTPException(415, "文件必须使用 UTF-8 编码") from exc
-    if not content.strip():
+    if not file.filename or Path(file.filename).suffix.lower() not in ALLOWED_UPLOAD_TYPES:
+        raise HTTPException(415, "仅支持 Markdown / TXT / PDF / DOCX / XLSX / PNG / JPG 文件")
+    max_bytes = settings.upload_max_mb * 1024 * 1024
+    raw = await file.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise HTTPException(413, f"文件不能超过 {settings.upload_max_mb} MB")
+    if not raw:
         raise HTTPException(422, "文件内容不能为空")
-    payload = DocumentCreate(
+    mime = _sniff_upload_mime(file.filename, raw)
+    checksum = hashlib.sha256(raw).hexdigest()
+    existing = db.scalar(select(SourceDocument).where(SourceDocument.checksum == checksum))
+    if existing:
+        return db.scalar(_document_query(existing.id))
+    storage_path = store_upload(file.filename, raw, checksum)
+    document = SourceDocument(
         title=title or file.filename,
-        content=content,
         source_type="file_upload",
         owner=owner,
-        metadata={"filename": file.filename, "content_type": file.content_type},
-        compile=compile,
+        checksum=checksum,
+        status="pending",
+        progress=0,
+        metadata_json={"filename": file.filename, "mime": mime, "compile": compile},
     )
-    document, created = ingest_document(db, payload)
-    if compile and created:
-        compile_document(db, document)
+    db.add(document)
+    db.flush()
+    document_file = DocumentFile(
+        document_id=document.id,
+        filename=file.filename,
+        mime=mime,
+        size_bytes=len(raw),
+        sha256=checksum,
+        storage_path=storage_path,
+    )
+    db.add(document_file)
+    db.flush()
+    document.file_id = document_file.id
+    db.commit()
+    dispatch_ingest(db, document)
     return db.scalar(_document_query(document.id))
+
+
+@router.get("/documents/{document_id}/status", response_model=DocumentStatusRead)
+def get_document_status(document_id: str, db: Session = Depends(get_db)):
+    document = db.get(SourceDocument, document_id)
+    if not document:
+        raise HTTPException(404, "Document not found")
+    return document
+
+
+@router.post("/documents/{document_id}/retry", response_model=DocumentStatusRead)
+def retry_document(document_id: str, db: Session = Depends(get_db)):
+    document = db.get(SourceDocument, document_id)
+    if not document:
+        raise HTTPException(404, "Document not found")
+    if document.status != "failed":
+        raise HTTPException(409, "只有失败的文档可以重试")
+    document.status = "pending"
+    document.progress = 0
+    document.error_message = None
+    db.commit()
+    dispatch_ingest(db, document)
+    db.refresh(document)
+    return document
 
 
 @router.post("/documents/batch", status_code=status.HTTP_201_CREATED)

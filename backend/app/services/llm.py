@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
-from typing import Any
+from typing import Any, Optional
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -115,6 +116,37 @@ class LLMGateway:
                 HumanMessage(content=f"问题：{query}\n\n知识：\n{compact}"),
             ]
         )
+
+    def describe_image(self, image_bytes: bytes, hint: Optional[str] = None) -> str:
+        """多模态图片描述：提取图中文字与结构。mock 模式返回确定性占位文本。"""
+        if not self._chat:
+            suffix = f"（{hint}）" if hint else ""
+            return f"[图片内容 mock 描述]{suffix}"
+        mime = "image/png" if image_bytes[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
+        vl_chat = ChatOpenAI(
+            model=settings.bailian_vl_model,
+            api_key=settings.bailian_api_key,
+            base_url=settings.bailian_base_url,
+            temperature=0.1,
+        )
+        message = HumanMessage(
+            content=[
+                {
+                    "type": "text",
+                    "text": "提取图片中的全部文字与表格/结构信息，用简洁中文描述。"
+                    + (f"上下文提示：{hint}" if hint else ""),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime};base64,{base64.b64encode(image_bytes).decode()}"
+                    },
+                },
+            ]
+        )
+        response = vl_chat.invoke([message])
+        content = response.content
+        return content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
 
 
 llm = LLMGateway()

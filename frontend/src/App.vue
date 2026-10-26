@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
   AgentArtifact,
   AgentTask,
@@ -8,6 +8,7 @@ import {
   EvaluationRun,
   IncidentRecord,
   IntegrationEvent,
+  KnowledgeDocument,
   QaRequirement,
   QaTestSuite,
   Review,
@@ -48,10 +49,11 @@ const query = ref('品牌经销商授权链路不完整时，应该如何审核�
 const searchResult = ref<SearchResponse | null>(null)
 const instruction = ref('根据知识库为品牌授权范围超出上游权限设计测试用例')
 const runMetrics = ref<Record<string, unknown> | null>(null)
-const uploadFile = ref<File | null>(null)
+const uploadFiles = ref<File[]>([])
 const uploadTitle = ref('')
 const uploadOwner = ref('unknown')
 const uploadCompile = ref(true)
+const documents = ref<KnowledgeDocument[]>([])
 const batchJson = ref('[\n  {\n    "title": "文档标题",\n    "content": "Markdown 或文本内容",\n    "owner": "unknown",\n    "compile": true\n  }\n]')
 const feishuToken = ref('')
 const feishuTitle = ref('')
@@ -87,6 +89,67 @@ const nav = [
 const viewTitle = computed(() => nav.find((item) => item[0] === view.value)?.[1] || '')
 const pendingReviews = computed(() => reviews.value.filter((item) => item.status === 'pending'))
 
+const DOC_STATUS_LABELS: Record<string, string> = {
+  pending: '待处理',
+  parsing: '解析中',
+  chunking: '切分中',
+  extracting: '抽取中',
+  indexing: '索引中',
+  compiling: '编译中',
+  processed: '已完成',
+  failed: '失败',
+}
+
+function docStatusLabel(doc: KnowledgeDocument) {
+  const label = DOC_STATUS_LABELS[doc.status] || doc.status
+  return doc.status === 'processed' || doc.status === 'failed' ? label : `${label} ${doc.progress}%`
+}
+
+function isIngesting(doc: KnowledgeDocument) {
+  return doc.status !== 'processed' && doc.status !== 'failed'
+}
+
+let pollTimer: ReturnType<typeof setTimeout> | undefined
+
+function scheduleDocumentPolling() {
+  if (pollTimer) clearTimeout(pollTimer)
+  pollTimer = undefined
+  if (!documents.value.some(isIngesting)) return
+  pollTimer = setTimeout(refreshIngestingDocuments, 2000)
+}
+
+async function refreshIngestingDocuments() {
+  const pending = documents.value.filter(isIngesting)
+  await Promise.all(
+    pending.map(async (doc) => {
+      try {
+        const status = await api<{ status: string; progress: number; error_message?: string | null }>(
+          `/documents/${doc.id}/status`,
+        )
+        doc.status = status.status
+        doc.progress = status.progress
+        doc.error_message = status.error_message ?? null
+      } catch {
+        /* 轮询失败静默，下轮重试 */
+      }
+    }),
+  )
+  scheduleDocumentPolling()
+}
+
+async function retryDocument(doc: KnowledgeDocument) {
+  await perform(async () => {
+    await api(`/documents/${doc.id}/retry`, { method: 'POST' })
+    notice.value = '重试已受理，处理中。'
+    await load()
+    scheduleDocumentPolling()
+  }, '重试失败')
+}
+
+onUnmounted(() => {
+  if (pollTimer) clearTimeout(pollTimer)
+})
+
 function message(e: unknown, fallback: string) {
   return e instanceof Error ? e.message : fallback
 }
@@ -103,18 +166,21 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    const [statsData, wikiData, reviewData, taskData, evaluationData] = await Promise.all([
-      api<Stats>('/dashboard'),
-      api<WikiPage[]>('/wiki'),
-      api<Review[]>('/reviews'),
-      api<AgentTask[]>('/agent/tasks'),
-      api<EvaluationRun[]>('/evaluations/runs'),
-    ])
+    const [statsData, wikiData, reviewData, taskData, evaluationData, documentData] =
+      await Promise.all([
+        api<Stats>('/dashboard'),
+        api<WikiPage[]>('/wiki'),
+        api<Review[]>('/reviews'),
+        api<AgentTask[]>('/agent/tasks'),
+        api<EvaluationRun[]>('/evaluations/runs'),
+        api<KnowledgeDocument[]>('/documents'),
+      ])
     stats.value = statsData
     wiki.value = wikiData
     reviews.value = reviewData
     tasks.value = taskData
     evaluationRuns.value = evaluationData
+    documents.value = documentData
     const [eventData, requirementData, suiteData, alertData, incidentData] = await Promise.all([
       api<IntegrationEvent[]>('/integrations/events'),
       api<QaRequirement[]>('/qa/requirements'),
@@ -140,6 +206,7 @@ async function load() {
     )
     selectedWiki.value = wikiData.find((page) => page.id === selectedWiki.value?.id) || wikiData[0] || null
     if (!runMetrics.value && evaluationData.length) runMetrics.value = evaluationData[0].metrics
+    scheduleDocumentPolling()
   } catch (e) {
     error.value = message(e, '加载失败')
   } finally {
@@ -161,25 +228,30 @@ async function perform(action: () => Promise<void>, fallback: string) {
 }
 
 function selectFile(event: Event) {
-  uploadFile.value = (event.target as HTMLInputElement).files?.[0] || null
+  uploadFiles.value = Array.from((event.target as HTMLInputElement).files || [])
 }
 
 async function uploadDocument() {
-  if (!uploadFile.value) {
-    error.value = '请选择 Markdown 或 TXT 文件。'
+  if (!uploadFiles.value.length) {
+    error.value = '请选择要上传的文件（Markdown / TXT / PDF / DOCX / XLSX / PNG / JPG）。'
     return
   }
   await perform(async () => {
-    const body = new FormData()
-    body.append('file', uploadFile.value as File)
-    body.append('title', uploadTitle.value.trim())
-    body.append('owner', uploadOwner.value.trim() || 'unknown')
-    body.append('compile', String(uploadCompile.value))
-    await api('/documents/upload', { method: 'POST', body })
-    notice.value = '文档上传完成。'
-    uploadFile.value = null
+    let accepted = 0
+    for (const file of uploadFiles.value) {
+      const body = new FormData()
+      body.append('file', file)
+      body.append('title', uploadTitle.value.trim())
+      body.append('owner', uploadOwner.value.trim() || 'unknown')
+      body.append('compile', String(uploadCompile.value))
+      await api('/documents/upload', { method: 'POST', body })
+      accepted += 1
+    }
+    notice.value = `已受理 ${accepted} 个文件，处理中。`
+    uploadFiles.value = []
     uploadTitle.value = ''
     await load()
+    scheduleDocumentPolling()
   }, '上传失败')
 }
 
@@ -433,8 +505,8 @@ onMounted(load)
         <div class="section-head"><span>INGESTION</span><h3>接入知识来源</h3><p>上传本地文件、批量提交 JSON，或导入飞书文档。</p></div>
         <div class="ingest-grid">
           <form class="ingest-card" @submit.prevent="uploadDocument">
-            <span class="eyebrow">MARKDOWN / TXT</span><h3>文件上传</h3>
-            <label>文件<input type="file" accept=".md,.markdown,.txt" @change="selectFile" /></label>
+            <span class="eyebrow">MARKDOWN / PDF / DOCX / XLSX / 图片</span><h3>文件上传</h3>
+            <label>文件（可多选）<input type="file" multiple accept=".md,.markdown,.txt,.pdf,.docx,.xlsx,.png,.jpg,.jpeg" @change="selectFile" /></label>
             <label>标题（可选）<input v-model="uploadTitle" placeholder="默认使用文件名" /></label>
             <label>Owner<input v-model="uploadOwner" /></label>
             <label class="check"><input v-model="uploadCompile" type="checkbox" />上传后立即编译</label>
@@ -453,6 +525,21 @@ onMounted(load)
             <label class="check"><input v-model="feishuCompile" type="checkbox" />导入后立即编译</label>
             <button class="primary" :disabled="loading" type="submit">导入飞书文档</button>
           </form>
+        </div>
+        <div class="section-head history-head"><span>DOCUMENTS</span><h3>入库文档 · {{ documents.length }}</h3><p>多模态解析与入库状态实时可见，失败文档可从断点重试。</p></div>
+        <div class="doc-table">
+          <div class="doc-row doc-row-head"><span>标题</span><span>来源</span><span>Owner</span><span>状态</span><span></span></div>
+          <div v-for="doc in documents" :key="doc.id" class="doc-row">
+            <span class="doc-title">{{ doc.title }}</span>
+            <span>{{ doc.source_type }}</span>
+            <span>{{ doc.owner }}</span>
+            <span>
+              <b :class="['status', doc.status === 'failed' ? 'failed' : isIngesting(doc) ? 'running' : '']">{{ docStatusLabel(doc) }}</b>
+              <small v-if="doc.status === 'failed' && doc.error_message" class="doc-error">{{ doc.error_message }}</small>
+            </span>
+            <span><button v-if="doc.status === 'failed'" class="ghost" :disabled="loading" @click="retryDocument(doc)">重试</button></span>
+          </div>
+          <div v-if="!documents.length" class="empty">暂无文档。</div>
         </div>
         <div class="split knowledge-browser">
           <div class="list-panel">
