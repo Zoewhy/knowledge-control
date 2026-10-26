@@ -1,5 +1,6 @@
 import math
 import re
+from collections import defaultdict
 from statistics import mean
 from typing import Callable
 
@@ -9,6 +10,32 @@ from sqlalchemy.orm import Session
 from ..models import EvaluationCase, EvaluationResult, EvaluationRun, utcnow
 from ..schemas import SearchResponse
 from .retrieval import hybrid_search
+
+ARM_FLAGS: dict[str, tuple[bool, bool]] = {
+    "G0": (True, True),
+    "G1": (False, True),
+    "G2": (True, False),
+    "G3": (False, False),
+}
+
+SCORER_NAMES = ("source_hit", "wiki_hit", "keyword_hit", "citation_validity", "rag_no_hit")
+
+
+def _aggregate_by_type(rows: list[dict]) -> dict[str, dict]:
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        grouped[row["question_type"]].append(row)
+    return {
+        question_type: {
+            "count": len(items),
+            "pass_rate": round(mean([item["pass"] for item in items]), 4),
+            **{
+                name: round(mean([item[name] for item in items]), 4)
+                for name in SCORER_NAMES
+            },
+        }
+        for question_type, items in sorted(grouped.items())
+    }
 
 
 def source_hit(case: EvaluationCase, response: SearchResponse) -> float:
@@ -83,7 +110,10 @@ class EvaluationEngine:
     def __init__(self, registry: ScorerRegistry) -> None:
         self.registry = registry
 
-    def run(self, db: Session) -> EvaluationRun:
+    def run(self, db: Session, arm: str = "G3") -> EvaluationRun:
+        if arm not in ARM_FLAGS:
+            raise ValueError(f"unknown evaluation arm: {arm}")
+        disable_wiki, disable_graph = ARM_FLAGS[arm]
         run = EvaluationRun()
         db.add(run)
         db.flush()
@@ -93,9 +123,16 @@ class EvaluationEngine:
         rows: list[dict] = []
         try:
             for case in cases:
-                response = hybrid_search(db, case.query, top_k=8)
+                response = hybrid_search(
+                    db,
+                    case.query,
+                    top_k=8,
+                    disable_wiki=disable_wiki,
+                    disable_graph=disable_graph,
+                )
                 metrics = self.registry.score(case, response)
                 metrics["latency_ms"] = response.latency_ms
+                metrics["question_type"] = case.question_type or "general"
                 metrics["pass"] = float(
                     metrics["source_hit"]
                     and metrics["keyword_hit"]
@@ -126,6 +163,7 @@ class EvaluationEngine:
             latencies = sorted(row["latency_ms"] for row in rows)
             p95_index = max(0, math.ceil(len(latencies) * 0.95) - 1)
             run.metrics = {
+                "arm": arm,
                 "cases": len(rows),
                 **{
                     name: round(mean([row[name] for row in rows]), 4) if rows else 0
@@ -140,6 +178,7 @@ class EvaluationEngine:
                 "pass_rate": round(mean([row["pass"] for row in rows]), 4) if rows else 0,
                 "avg_latency_ms": round(mean(latencies), 2) if rows else 0,
                 "p95_latency_ms": round(latencies[p95_index], 2) if rows else 0,
+                "by_type": _aggregate_by_type(rows),
             }
             run.status = "succeeded"
         except Exception as exc:
@@ -157,5 +196,5 @@ class EvaluationEngine:
 engine = EvaluationEngine(scorer_registry)
 
 
-def run_evaluation(db: Session) -> EvaluationRun:
-    return engine.run(db)
+def run_evaluation(db: Session, arm: str = "G3") -> EvaluationRun:
+    return engine.run(db, arm=arm)

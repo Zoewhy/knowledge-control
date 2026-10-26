@@ -289,6 +289,9 @@ class EvaluationCase(Base):
     query: Mapped[str] = mapped_column(Text)
     expected_sources: Mapped[list] = mapped_column(JSON, default=list)
     expected_keywords: Mapped[list] = mapped_column(JSON, default=list)
+    question_type: Mapped[str] = mapped_column(
+        String(40), default="general", server_default="general"
+    )
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
 

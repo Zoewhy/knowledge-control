@@ -237,8 +237,27 @@ def _merge(merged: dict[str, SearchHit], hit: SearchHit) -> None:
     current.channel = "+".join(dict.fromkeys([*current.channel.split("+"), hit.channel]))
 
 
+def _seed_sections_from_sources(db: Session, source_hits: list[SearchHit]) -> set[str]:
+    segment_ids = [hit.segment_id for hit in source_hits if hit.segment_id]
+    if not segment_ids:
+        return set()
+    return set(
+        db.scalars(
+            select(WikiCitation.section_id)
+            .join(SourceClaim, WikiCitation.claim_id == SourceClaim.id)
+            .where(SourceClaim.segment_id.in_(segment_ids))
+            .distinct()
+        ).all()
+    )
+
+
 def hybrid_search(
-    db: Session, query: str, top_k: int = 8, include_answer: bool = True
+    db: Session,
+    query: str,
+    top_k: int = 8,
+    include_answer: bool = True,
+    disable_wiki: bool = False,
+    disable_graph: bool = False,
 ) -> SearchResponse:
     start = time.perf_counter()
     trace_id = uuid.uuid4().hex
@@ -260,6 +279,10 @@ def hybrid_search(
         "source_vector",
         "elasticsearch_bm25",
     ]
+    if disable_wiki:
+        branch_names = [
+            name for name in branch_names if name not in {"wiki_lexical", "wiki_vector"}
+        ]
     executor = ThreadPoolExecutor(max_workers=settings.retrieval_max_workers)
     futures = {
         name: executor.submit(_run_branch, name, retrieval_query, top_k) for name in branch_names
@@ -279,11 +302,20 @@ def hybrid_search(
         for hit in result.hits:
             if hit.segment_id:
                 _merge(source_candidates, hit)
-            else:
+            elif not disable_wiki:
                 _merge(target, hit)
 
-    seed_section_ids = {hit.section_id for hit in merged.values() if hit.section_id}
-    graph_section_ids, graph_paths = expand_graph(db, seed_section_ids)
+    if disable_graph:
+        graph_section_ids: set[str] = set()
+        graph_paths: list[dict] = []
+    else:
+        seed_section_ids = {hit.section_id for hit in merged.values() if hit.section_id}
+        if disable_wiki and not seed_section_ids:
+            top_sources = sorted(
+                source_candidates.values(), key=lambda hit: hit.score, reverse=True
+            )[:top_k]
+            seed_section_ids = _seed_sections_from_sources(db, top_sources)
+        graph_section_ids, graph_paths = expand_graph(db, seed_section_ids)
     if graph_section_ids:
         graph_sections = db.scalars(
             select(WikiSection)
@@ -304,7 +336,7 @@ def hybrid_search(
             )
 
     best_wiki_score = max((hit.score for hit in merged.values()), default=0.0)
-    fallback_used = best_wiki_score < settings.wiki_fallback_score
+    fallback_used = disable_wiki or best_wiki_score < settings.wiki_fallback_score
     if fallback_used:
         for hit in source_candidates.values():
             _merge(merged, hit)
@@ -351,6 +383,7 @@ def hybrid_search(
         "llm_mode": "bailian" if llm.enabled else "mock",
         "query_expansions": expansions,
         "graph_paths": graph_paths,
+        "ablation": {"disable_wiki": disable_wiki, "disable_graph": disable_graph},
     }
     return SearchResponse(
         query=query,

@@ -49,8 +49,11 @@ from .schemas import (
     DocumentBatchCreate,
     DocumentCreate,
     DocumentRead,
+    EvaluationArmSummary,
     EvaluationCaseCreate,
+    EvaluationCompareResponse,
     EvaluationRunRead,
+    EvaluationRunRequest,
     FeishuDocumentImport,
     IncidentRecordRead,
     IntegrationEventRead,
@@ -436,13 +439,36 @@ def add_evaluation_case(payload: EvaluationCaseCreate, db: Session = Depends(get
 
 
 @router.post("/evaluations/runs", response_model=EvaluationRunRead)
-def add_evaluation_run(db: Session = Depends(get_db)):
-    run = run_evaluation(db)
+def add_evaluation_run(
+    payload: Optional[EvaluationRunRequest] = None, db: Session = Depends(get_db)
+):
+    arm = payload.arm if payload else "G3"
+    run = run_evaluation(db, arm=arm)
     return db.scalar(
         select(EvaluationRun)
         .where(EvaluationRun.id == run.id)
         .options(selectinload(EvaluationRun.results))
     )
+
+
+@router.get("/evaluations/compare", response_model=EvaluationCompareResponse)
+def compare_evaluations(db: Session = Depends(get_db)):
+    runs = db.scalars(select(EvaluationRun).order_by(EvaluationRun.created_at.desc())).all()
+    arms: dict[str, EvaluationArmSummary] = {}
+    for run in runs:
+        arm = (run.metrics or {}).get("arm")
+        if not arm or arm in arms:
+            continue
+        overall = {
+            key: value for key, value in run.metrics.items() if key not in {"arm", "by_type"}
+        }
+        arms[arm] = EvaluationArmSummary(
+            run_id=run.id,
+            created_at=run.created_at,
+            overall=overall,
+            by_type=run.metrics.get("by_type", {}),
+        )
+    return EvaluationCompareResponse(arms=arms)
 
 
 @router.get("/evaluations/runs", response_model=list[EvaluationRunRead])

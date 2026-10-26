@@ -196,6 +196,22 @@ class EvaluationCaseCreate(BaseModel):
     query: str
     expected_sources: list[str] = Field(default_factory=list)
     expected_keywords: list[str] = Field(default_factory=list)
+    question_type: str = "general"
+
+
+class EvaluationRunRequest(BaseModel):
+    arm: Literal["G0", "G1", "G2", "G3"] = "G3"
+
+
+class EvaluationArmSummary(BaseModel):
+    run_id: str
+    created_at: datetime
+    overall: dict[str, Any] = Field(default_factory=dict)
+    by_type: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvaluationCompareResponse(BaseModel):
+    arms: dict[str, EvaluationArmSummary] = Field(default_factory=dict)
 
 
 class EvaluationResultRead(ORMModel):
