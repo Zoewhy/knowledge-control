@@ -5,6 +5,7 @@ import {
   AgentTask,
   AlertEvent,
   api,
+  baseUrl,
   EvaluationRun,
   IncidentRecord,
   IntegrationEvent,
@@ -12,7 +13,6 @@ import {
   QaRequirement,
   QaTestSuite,
   Review,
-  SearchResponse,
   Stats,
   WikiPage,
 } from './api'
@@ -46,7 +46,15 @@ const tasks = ref<AgentTask[]>([])
 const evaluationRuns = ref<EvaluationRun[]>([])
 const selectedWiki = ref<WikiPage | null>(null)
 const query = ref('品牌经销商授权链路不完整时，应该如何审核和补充材料？')
-const searchResult = ref<SearchResponse | null>(null)
+const chatStreaming = ref(false)
+type ChatSource = { title: string; score: number; channel?: string; snippet?: string }
+type ChatMessage = {
+  role: 'user' | 'assistant'
+  content: string
+  sources?: ChatSource[]
+  error?: string
+}
+const chatMessages = ref<ChatMessage[]>([])
 const instruction = ref('根据知识库为品牌授权范围超出上游权限设计测试用例')
 const runMetrics = ref<Record<string, unknown> | null>(null)
 const uploadFiles = ref<File[]>([])
@@ -301,13 +309,65 @@ async function importFeishu() {
   }, '飞书导入失败')
 }
 
-async function doSearch() {
-  await perform(async () => {
-    searchResult.value = await api<SearchResponse>('/search', {
+function dispatchSseEvent(raw: string, message: ChatMessage) {
+  let event = ''
+  let data = ''
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('event: ')) event = line.slice(7).trim()
+    else if (line.startsWith('data: ')) data = line.slice(6)
+  }
+  if (!event || !data) return
+  const payload = JSON.parse(data)
+  if (event === 'sources') {
+    message.sources = payload.sources || []
+  } else if (event === 'token') {
+    message.content += payload.text || ''
+  } else if (event === 'error') {
+    message.error = payload.message || '生成失败'
+  }
+}
+
+async function sendChat() {
+  const text = query.value.trim()
+  if (!text || chatStreaming.value) return
+  query.value = ''
+  chatMessages.value.push({ role: 'user', content: text })
+  const assistant: ChatMessage = { role: 'assistant', content: '', sources: [] }
+  chatMessages.value.push(assistant)
+  chatStreaming.value = true
+  error.value = ''
+  try {
+    const history = chatMessages.value
+      .slice(0, -2)
+      .slice(-6)
+      .map((item) => ({ role: item.role, content: item.content }))
+    const response = await fetch(`${baseUrl}/chat/stream`, {
       method: 'POST',
-      body: JSON.stringify({ query: query.value, top_k: 8, include_answer: true }),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: text, top_k: 8, history }),
     })
-  }, '检索失败')
+    if (!response.ok || !response.body) {
+      throw new Error((await response.text()) || `HTTP ${response.status}`)
+    }
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      let boundary = buffer.indexOf('\n\n')
+      while (boundary >= 0) {
+        dispatchSseEvent(buffer.slice(0, boundary), assistant)
+        buffer = buffer.slice(boundary + 2)
+        boundary = buffer.indexOf('\n\n')
+      }
+    }
+  } catch (e) {
+    assistant.error = message(e, '问答失败')
+  } finally {
+    chatStreaming.value = false
+  }
 }
 
 async function decide(item: Review, decision: 'approve' | 'reject' | 'source_only') {
@@ -580,9 +640,29 @@ onMounted(load)
       </section>
 
       <section v-else-if="view === 'search'" class="view">
-        <div class="search-box"><span>ASK MERCHANT KNOWLEDGE</span><textarea v-model="query" rows="3"></textarea><button class="primary" :disabled="loading" @click="doSearch">执行混合检索 ↗</button></div>
-        <div v-if="searchResult" class="answer"><div class="answer-head"><span>GROUNDED ANSWER</span><b>{{ searchResult.latency_ms }} ms</b></div><p>{{ searchResult.answer }}</p>
-          <div class="hits"><article v-for="(hit, index) in searchResult.hits" :key="index"><div><b>[{{ index + 1 }}]</b><span>{{ hit.channel }}</span><em>{{ hit.score.toFixed(3) }}</em></div><h3>{{ hit.title }}</h3><p>{{ hit.content }}</p><small v-if="hit.source">SOURCE / {{ hit.source.document_title }}</small></article></div>
+        <div class="chat-panel">
+          <div class="chat-messages">
+            <div v-for="(msg, index) in chatMessages" :key="index" :class="['chat-message', msg.role]">
+              <div class="chat-bubble">
+                <p>
+                  {{ msg.content }}<span v-if="msg.role === 'assistant' && chatStreaming && index === chatMessages.length - 1" class="caret">▍</span>
+                  <em v-if="msg.role === 'assistant' && chatStreaming && index === chatMessages.length - 1 && !msg.content" class="chat-waiting">检索并生成中…</em>
+                </p>
+                <p v-if="msg.error" class="error-text">{{ msg.error }}</p>
+                <details v-if="msg.sources?.length" class="chat-sources">
+                  <summary>来源 · {{ msg.sources.length }}</summary>
+                  <div v-for="(source, sourceIndex) in msg.sources" :key="sourceIndex" class="chat-source">
+                    <b>[{{ sourceIndex + 1 }}]</b><span>{{ source.title }}</span><em>{{ source.score.toFixed(3) }}</em>
+                  </div>
+                </details>
+              </div>
+            </div>
+            <div v-if="!chatMessages.length" class="empty large">向知识库提问，回答将逐字生成并标注来源。</div>
+          </div>
+          <div class="chat-input">
+            <input v-model="query" :disabled="chatStreaming" placeholder="输入问题，Enter 发送" @keyup.enter="sendChat" />
+            <button class="primary" :disabled="chatStreaming || !query.trim()" @click="sendChat">{{ chatStreaming ? '生成中…' : '发送' }}</button>
+          </div>
         </div>
       </section>
 

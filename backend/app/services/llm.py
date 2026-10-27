@@ -7,7 +7,7 @@ import math
 from typing import Any, Optional
 
 from langchain_core.embeddings import Embeddings
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
@@ -99,6 +99,10 @@ class LLMGateway:
             values.extend([0.0] * (dimensions - len(values)))
         return values[:dimensions]
 
+    _ANSWER_SYSTEM_PROMPT = (
+        "仅依据提供的知识回答。每个事实用 [n] 标注来源；证据不足时明确说明。"
+    )
+
     def answer(self, query: str, contexts: list[dict[str, Any]]) -> str:
         if not contexts:
             return "知识库中暂未找到足够信息。"
@@ -110,12 +114,51 @@ class LLMGateway:
             return f"根据知识库，最相关的信息是：{contexts[0]['content'][:320]} [1]"
         return self._answer_chain.invoke(
             [
-                SystemMessage(
-                    content="仅依据提供的知识回答。每个事实用 [n] 标注来源；证据不足时明确说明。"
-                ),
+                SystemMessage(content=self._ANSWER_SYSTEM_PROMPT),
                 HumanMessage(content=f"问题：{query}\n\n知识：\n{compact}"),
             ]
         )
+
+    def _answer_messages(
+        self,
+        query: str,
+        contexts: list[dict[str, Any]],
+        history: list[dict[str, Any]] | None,
+    ) -> list:
+        compact = "\n\n".join(
+            f"[{index + 1}] {item['title']}\n{item['content']}"
+            for index, item in enumerate(contexts[:6])
+        )
+        messages: list = [SystemMessage(content=self._ANSWER_SYSTEM_PROMPT)]
+        for item in (history or [])[-6:]:
+            content = str(item.get("content", "")).strip()
+            if not content:
+                continue
+            if item.get("role") == "assistant":
+                messages.append(AIMessage(content=content))
+            else:
+                messages.append(HumanMessage(content=content))
+        messages.append(HumanMessage(content=f"问题：{query}\n\n知识：\n{compact}"))
+        return messages
+
+    def stream_answer(
+        self,
+        query: str,
+        contexts: list[dict[str, Any]],
+        history: list[dict[str, Any]] | None = None,
+    ):
+        """流式回答生成器。mock 模式复用罐头答案并按固定宽度切块，保证确定性、零网络。"""
+        if not self._answer_chain:
+            canned = self.answer(query, contexts)
+            for index in range(0, len(canned), 12):
+                yield canned[index : index + 12]
+            return
+        for chunk in self._answer_chain.stream(
+            self._answer_messages(query, contexts, history)
+        ):
+            text = chunk if isinstance(chunk, str) else str(chunk)
+            if text:
+                yield text
 
     def describe_image(self, image_bytes: bytes, hint: Optional[str] = None) -> str:
         """多模态图片描述：提取图中文字与结构。mock 模式返回确定性占位文本。"""

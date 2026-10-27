@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -17,6 +18,7 @@ from fastapi import (
     UploadFile,
     status,
 )
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
@@ -49,6 +51,7 @@ from .schemas import (
     AgentTaskRead,
     AlertEventRead,
     AlertWebhook,
+    ChatStreamRequest,
     DashboardStats,
     DocumentBatchCreate,
     DocumentCreate,
@@ -87,6 +90,7 @@ from .services.integrations import (
     handle_feishu_event,
     ingest_alert,
 )
+from .services.llm import llm
 from .services.qa_tools import build_suite_report
 from .services.retrieval import hybrid_search
 from .services.scheduler import dispatch_task
@@ -418,6 +422,48 @@ def review_decision(task_id: str, payload: ReviewDecision, db: Session = Depends
 @router.post("/search", response_model=SearchResponse)
 def search(payload: SearchRequest, db: Session = Depends(get_db)):
     return hybrid_search(db, payload.query, payload.top_k, payload.include_answer)
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+@router.post("/chat/stream")
+def chat_stream(payload: ChatStreamRequest, db: Session = Depends(get_db)):
+    result = hybrid_search(db, payload.query, top_k=payload.top_k, include_answer=False)
+    # 进入流式生成器前物化全部数据：流期间请求作用域的 db session 可能已关闭
+    sources = [
+        {
+            "title": hit.title,
+            "score": hit.score,
+            "channel": hit.channel,
+            "section_id": hit.section_id,
+            "segment_id": hit.segment_id,
+            "snippet": hit.content[:160],
+        }
+        for hit in result.hits
+    ]
+    diagnostics = {
+        "channels": result.diagnostics.get("channels", {}),
+        "graph_paths": len(result.diagnostics.get("graph_paths") or []),
+        "fallback_used": result.diagnostics.get("fallback_used", False),
+    }
+    contexts = [{"title": hit.title, "content": hit.content} for hit in result.hits]
+    query = payload.query
+    history = payload.history[-6:]
+
+    def events():
+        started = time.perf_counter()
+        try:
+            yield _sse("sources", {"sources": sources, "diagnostics": diagnostics})
+            for chunk in llm.stream_answer(query, contexts, history):
+                yield _sse("token", {"text": chunk})
+            latency_ms = round((time.perf_counter() - started) * 1000, 2)
+            yield _sse("done", {"latency_ms": latency_ms})
+        except Exception as exc:
+            yield _sse("error", {"message": str(exc)[:300]})
+
+    return StreamingResponse(events(), media_type="text/event-stream")
 
 
 @router.get("/tools")

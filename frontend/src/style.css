@@ -58,4 +58,21 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 .review-editor { display: grid; grid-template-columns: 1fr 1fr 1.5fr; gap: 12px; margin-top: 18px; }.review-editor .wide { grid-column: 1 / -1; }
 .task-head { display: flex; justify-content: space-between; }.task-error pre, .event-list pre, .artifact pre { overflow: auto; white-space: pre-wrap; word-break: break-word; color: #9ca5aa; background: #0b0e12; padding: 12px; font: 10px/1.6 DM Mono; }.task-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }.task-detail { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; border-top: 1px solid var(--line); margin-top: 20px; padding-top: 8px; }.task-detail h4 { color: #838a91; font: 10px DM Mono; letter-spacing: .1em; }.event-list { display: grid; gap: 8px; }.event-list article, .artifact { padding: 12px; background: #101419; border: 1px solid var(--line); }.event-list article > div, .artifact > div { display: flex; justify-content: space-between; gap: 12px; }.event-list strong, .artifact strong { font-size: 11px; }.event-list span, .artifact span { color: #626a70; font: 8px DM Mono; }.artifact { margin-top: 10px; }.artifact pre { max-height: 240px; }.artifact button { margin-top: 8px; }
 .history-head { margin-top: 44px; }.run-card { margin-top: 16px; padding: 22px; background: var(--panel); border: 1px solid var(--line); }.run-head, .run-head > div { display: flex; align-items: center; justify-content: space-between; gap: 16px; }.run-head strong { font-size: 12px; }.run-head small { color: #626a70; font: 9px DM Mono; }.run-metrics { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }.run-metrics span { padding: 7px 9px; background: #0c0f13; color: #777f85; font: 9px DM Mono; }.run-metrics b { color: var(--lime); font-weight: 400; }.run-card details { margin-top: 18px; }.run-card summary { cursor: pointer; color: #9ca5aa; font-size: 11px; }.result-card { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 14px; }.result-card > small { color: #626a70; font: 9px DM Mono; }.result-card p { color: #b7bdc1; font-size: 12px; line-height: 1.7; white-space: pre-line; }
+.chat-panel { display: flex; flex-direction: column; gap: 18px; height: calc(100vh - 190px); }
+.chat-messages { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; padding-right: 8px; }
+.chat-message { display: flex; }.chat-message.user { justify-content: flex-end; }
+.chat-bubble { max-width: 72%; padding: 14px 18px; border: 1px solid var(--line); background: var(--panel); color: #dde3de; }
+.chat-message.user .chat-bubble { background: #1a2413; border-color: #3c5123; }
+.chat-bubble p { margin: 0; font-size: 13px; line-height: 1.8; white-space: pre-wrap; word-break: break-word; }
+.chat-bubble .caret { color: var(--lime); animation: chat-blink 1s steps(2) infinite; }
+.chat-waiting { color: var(--muted); font: 10px DM Mono; font-style: normal; }
+@keyframes chat-blink { 50% { opacity: 0; } }
+.chat-sources { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; }
+.chat-sources summary { cursor: pointer; color: var(--muted); font: 9px DM Mono; letter-spacing: .08em; }
+.chat-source { display: flex; gap: 8px; align-items: baseline; margin-top: 6px; font: 10px DM Mono; color: #939ca1; }
+.chat-source b { color: var(--lime); font-weight: 400; }.chat-source span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.chat-source em { margin-left: auto; font-style: normal; color: #626a70; }
+.chat-input { display: flex; gap: 12px; padding: 16px; background: var(--panel); border: 1px solid var(--line); }
+.chat-input input { flex: 1; border: 0; border-bottom: 1px solid #465058; background: transparent; color: white; outline: none; padding: 9px 0; font-size: 14px; }
+.chat-input input:focus { border-bottom-color: #718746; }
+@media (max-width: 1150px) { .chat-bubble { max-width: 88%; } }
 @media (max-width: 1150px) { main { padding-inline: 30px; }.orb { display: none; }.pipeline div { min-width: 100px; }.hits { grid-template-columns: 1fr; }.ingest-grid { grid-template-columns: 1fr 1fr; }.batch-card { grid-row: span 2; }.review-editor { grid-template-columns: 1fr; }.review-editor .wide { grid-column: auto; } }

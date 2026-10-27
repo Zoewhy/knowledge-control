@@ -134,6 +134,12 @@ class SearchRequest(BaseModel):
     include_answer: bool = True
 
 
+class ChatStreamRequest(BaseModel):
+    query: str = Field(min_length=1)
+    top_k: int = Field(default=8, ge=1, le=50)
+    history: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class SearchHit(BaseModel):
     channel: str
     score: float
