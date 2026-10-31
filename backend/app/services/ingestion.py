@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from sqlalchemy import func, select
@@ -8,6 +9,7 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..models import DocumentFile, SourceClaim, SourceDocument, SourceSegment
 from ..schemas import DocumentCreate
+from .graph import extract_dependencies_to_graph
 from .llm import llm
 from .parsing import parse_document
 from .parsing.types import ImageBlock, TableBlock, TextBlock
@@ -25,6 +27,8 @@ INGEST_STEPS = ("parsing", "chunking", "extracting", "indexing", "compiling")
 _STEP_PROGRESS = {"parsing": 10, "chunking": 35, "extracting": 60, "indexing": 85, "compiling": 95}
 PDF_MIN_TEXT_CHARS = 100
 
+logger = logging.getLogger(__name__)
+
 
 def _add_claims(db: Session, segment: SourceSegment) -> None:
     for item in llm.extract_claims(segment.content, segment.heading):
@@ -40,6 +44,15 @@ def _add_claims(db: Session, segment: SourceSegment) -> None:
                 fingerprint=fingerprint(statement),
             )
         )
+
+
+def _index_claim_dependencies(db: Session, claims: list[SourceClaim]) -> None:
+    """从 claim 文本抽取服务依赖边；失败只记 warning，不阻断入库管线。"""
+    for claim in claims:
+        try:
+            extract_dependencies_to_graph(db, claim.statement, claim.id)
+        except Exception as exc:
+            logger.warning("dependency extraction failed for claim %s: %s", claim.id, exc)
 
 
 def ingest_document(db: Session, payload: DocumentCreate) -> tuple[SourceDocument, bool]:
@@ -77,6 +90,8 @@ def ingest_document(db: Session, payload: DocumentCreate) -> tuple[SourceDocumen
             segment.id, document.id, document.title, segment.heading, segment.content
         )
         _add_claims(db, segment)
+        db.flush()
+        _index_claim_dependencies(db, list(segment.claims))
     db.commit()
     db.refresh(document)
     return document, True
@@ -243,6 +258,7 @@ def run_ingest_pipeline(db: Session, document_id: str) -> SourceDocument:
 
         step = "indexing"
         _mark_step(db, document, "indexing")
+        newly_indexed: list[SourceSegment] = []
         for segment in segments:
             if segment.embedding:
                 continue
@@ -251,6 +267,16 @@ def run_ingest_pipeline(db: Session, document_id: str) -> SourceDocument:
             search_index.index_segment(
                 segment.id, document.id, document.title, segment.heading, segment.content
             )
+            newly_indexed.append(segment)
+        if newly_indexed:
+            new_claims = list(
+                db.scalars(
+                    select(SourceClaim).where(
+                        SourceClaim.segment_id.in_([segment.id for segment in newly_indexed])
+                    )
+                ).all()
+            )
+            _index_claim_dependencies(db, new_claims)
         db.commit()
 
         if document.metadata_json.get("compile", True):

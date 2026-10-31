@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..models import AgentTask, AlertEvent, IncidentRecord
+from ..models import AgentTask, AlertEvent, IncidentRecord, WikiCitation
 from .feishu import FeishuError, feishu_client
-from .graph import query_graph
+from .graph import graph_store, query_graph
 from .llm import llm
 from .retrieval import hybrid_search
+from .text import lexical_score
+
+logger = logging.getLogger(__name__)
 
 
 class HypothesisDraft(BaseModel):
@@ -66,6 +71,26 @@ def _fallback_hypotheses(alert: AlertEvent) -> list[dict[str, Any]]:
     ]
 
 
+def _similar_incidents_lexical(
+    db: Session, alert: AlertEvent, limit: int = 5, threshold: float = 0.5
+) -> list[dict[str, Any]]:
+    """新事件尚未建图边，用 alert 文本在历史 IncidentRecord 里做词面匹配。"""
+    text = f"{alert.title} {alert.service}"
+    matched: list[dict[str, Any]] = []
+    for incident in db.scalars(select(IncidentRecord)).all():
+        score = lexical_score(text, f"{incident.title} {incident.summary}")
+        if score >= threshold:
+            matched.append(
+                {
+                    "incident_id": incident.id,
+                    "title": incident.title,
+                    "score": round(score, 4),
+                    "root_cause_hypothesis": incident.root_cause_hypothesis,
+                }
+            )
+    return sorted(matched, key=lambda item: item["score"], reverse=True)[:limit]
+
+
 def incident_hypothesis_generate(db: Session, args: dict[str, Any]) -> dict[str, Any]:
     alert = _get_alert(db, str(args["alert_id"]))
     query_text = f"{alert.title} {alert.service}".strip()
@@ -79,6 +104,8 @@ def incident_hypothesis_generate(db: Session, args: dict[str, Any]) -> dict[str,
         }
         for hit in knowledge.hits
     ]
+    dependency_chain = graph_store().dependency_chain(db, alert.service)
+    similar_incidents = _similar_incidents_lexical(db, alert)
     fallback = HypothesisDraft(
         summary=(
             f"{alert.severity} 告警「{alert.title}」"
@@ -99,7 +126,9 @@ def incident_hypothesis_generate(db: Session, args: dict[str, Any]) -> dict[str,
         "{summary,hypotheses:[{cause,evidence}],impact,recommended_actions:[...],uncertainty}。"
         "只能输出根因假设，禁止声称根因已确认。",
         f"告警：{fallback['summary']}\n描述：{alert.description}\n"
-        f"知识：{[hit.content for hit in knowledge.hits]}",
+        f"知识：{[hit.content for hit in knowledge.hits]}\n"
+        f"依赖链：{dependency_chain}\n"
+        f"相似事件：{[item['title'] for item in similar_incidents]}",
         fallback,
     )
     try:
@@ -110,6 +139,8 @@ def incident_hypothesis_generate(db: Session, args: dict[str, Any]) -> dict[str,
         triage = fallback
     triage["knowledge_references"] = references
     triage["graph_paths"] = query_graph(db, query_text, limit=5)
+    triage["dependency_chain"] = dependency_chain
+    triage["similar_incidents"] = similar_incidents
     alert.triage = triage
     alert.status = "triaged"
     db.commit()
@@ -149,6 +180,40 @@ def incident_record_create(db: Session, args: dict[str, Any]) -> dict[str, Any]:
     alert.status = "recorded"
     db.commit()
     db.refresh(incident)
+    try:
+        similar: list[tuple[str, float]] = []
+        for other in db.scalars(
+            select(IncidentRecord).where(IncidentRecord.id != incident.id)
+        ).all():
+            score = lexical_score(
+                f"{incident.title} {incident.summary}",
+                f"{other.title} {other.summary}",
+            )
+            if score >= 0.5:
+                similar.append((other.id, round(score, 4)))
+        graph_store().register_incident(db, incident.id, incident.title, similar)
+        claim_ids = [
+            citation.get("claim_id")
+            for reference in triage.get("knowledge_references", [])
+            for citation in reference.get("citations", [])
+            if citation.get("claim_id")
+        ]
+        section_ids = (
+            list(
+                db.scalars(
+                    select(WikiCitation.section_id)
+                    .where(WikiCitation.claim_id.in_(claim_ids))
+                    .distinct()
+                ).all()
+            )[:5]
+            if claim_ids
+            else []
+        )
+        graph_store().mark_incident_resolved(db, incident.title, section_ids)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning("incident graph registration failed for %s: %s", incident.id, exc)
     return {"incident_id": incident.id, "reused": False}
 
 

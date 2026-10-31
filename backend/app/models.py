@@ -210,6 +210,7 @@ class KnowledgeRelation(Base):
     subject_entity_id: Mapped[str] = mapped_column(ForeignKey("knowledge_entities.id"), index=True)
     object_entity_id: Mapped[str] = mapped_column(ForeignKey("knowledge_entities.id"), index=True)
     predicate: Mapped[str] = mapped_column(String(80), default="related_to")
+    confidence: Mapped[float] = mapped_column(Float, default=1.0, server_default="1.0")
     claim_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey("source_claims.id"), nullable=True, index=True
     )
