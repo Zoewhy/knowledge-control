@@ -217,10 +217,25 @@ class EvaluationCaseCreate(BaseModel):
     expected_sources: list[str] = Field(default_factory=list)
     expected_keywords: list[str] = Field(default_factory=list)
     question_type: str = "general"
+    eval_group: str = Field(default="default", max_length=60)
+
+
+class EvaluationSetImportCase(BaseModel):
+    query: str = Field(min_length=1)
+    name: Optional[str] = Field(default=None, max_length=200)
+    expected_sources: list[str] = Field(default_factory=list)
+    expected_keywords: list[str] = Field(default_factory=list)
+    question_type: str = "general"
+
+
+class EvaluationSetImport(BaseModel):
+    eval_group: str = Field(min_length=1, max_length=60)
+    cases: list[EvaluationSetImportCase] = Field(min_length=1, max_length=2000)
 
 
 class EvaluationRunRequest(BaseModel):
     arm: Literal["G0", "G1", "G2", "G3"] = "G3"
+    eval_group: Optional[str] = Field(default=None, max_length=60)
 
 
 class EvaluationArmSummary(BaseModel):
@@ -249,6 +264,120 @@ class EvaluationRunRead(ORMModel):
     created_at: datetime
     finished_at: Optional[datetime]
     results: list[EvaluationResultRead] = Field(default_factory=list)
+
+
+# ---------- 入库策略与实验 ----------
+
+
+class HeadingChunkParams(BaseModel):
+    max_tokens: int = Field(default=512, ge=16, le=8192)
+    overlap_tokens: int = Field(default=50, ge=0, le=2048)
+
+
+class FixedChunkParams(HeadingChunkParams):
+    pass
+
+
+class RecursiveChunkParams(HeadingChunkParams):
+    pass
+
+
+class PageChunkParams(BaseModel):
+    max_tokens: int = Field(default=1024, ge=16, le=8192)
+    overlap_tokens: int = Field(default=50, ge=0, le=2048)
+
+
+class TableRowChunkParams(HeadingChunkParams):
+    rows_per_segment: int = Field(default=20, ge=1, le=1000)
+    small_table_rows: int = Field(default=20, ge=0, le=10000)
+
+
+CHUNK_PARAM_SCHEMAS: dict[str, type[BaseModel]] = {
+    "heading": HeadingChunkParams,
+    "fixed": FixedChunkParams,
+    "recursive": RecursiveChunkParams,
+    "page": PageChunkParams,
+    "table_row": TableRowChunkParams,
+}
+
+
+def validate_chunk_params(strategy: str, params: dict[str, Any] | None) -> dict[str, Any]:
+    schema = CHUNK_PARAM_SCHEMAS.get(strategy or "")
+    if schema is None:
+        raise ValueError(
+            f"未知切分策略: {strategy}（可选: {', '.join(sorted(CHUNK_PARAM_SCHEMAS))}）"
+        )
+    return schema.model_validate(params or {}).model_dump()
+
+
+class IngestPolicyCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    doc_pattern: str = Field(default="*", max_length=300)
+    parser_strategy: Literal["auto", "text_only"] = "auto"
+    chunk_strategy: str = "heading"
+    chunk_params: dict[str, Any] = Field(default_factory=dict)
+    table_mode: Literal["chunk", "structured", "hybrid"] = "chunk"
+    min_text_chars: int = Field(default=100, ge=0)
+    auto_compile: bool = True
+
+
+class IngestPolicyUpdate(BaseModel):
+    doc_pattern: Optional[str] = Field(default=None, max_length=300)
+    parser_strategy: Optional[Literal["auto", "text_only"]] = None
+    chunk_strategy: Optional[str] = None
+    chunk_params: Optional[dict[str, Any]] = None
+    table_mode: Optional[Literal["chunk", "structured", "hybrid"]] = None
+    min_text_chars: Optional[int] = Field(default=None, ge=0)
+    auto_compile: Optional[bool] = None
+
+
+class IngestPolicyRead(ORMModel):
+    id: str
+    name: str
+    doc_pattern: str
+    parser_strategy: str
+    chunk_strategy: str
+    chunk_params: dict[str, Any]
+    table_mode: str
+    min_text_chars: int
+    auto_compile: bool
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class ExperimentCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=300)
+    document_ids: list[str] = Field(min_length=1, max_length=200)
+    policy_ids: list[str] = Field(min_length=1, max_length=20)
+    eval_group: str = Field(default="default", max_length=60)
+
+
+class ExperimentApplyRequest(BaseModel):
+    run_id: str = Field(min_length=1)
+
+
+class StrategyExperimentRunRead(ORMModel):
+    id: str
+    experiment_id: str
+    policy_snapshot: dict[str, Any]
+    status: str
+    error_message: Optional[str]
+    metrics: dict[str, Any]
+    eval_run_id: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+
+
+class StrategyExperimentRead(ORMModel):
+    id: str
+    name: str
+    document_ids: list[Any]
+    eval_group: str
+    target_metrics: Optional[dict[str, Any]]
+    applied_run_id: Optional[str]
+    created_at: datetime
+    runs: list[StrategyExperimentRunRead] = Field(default_factory=list)
 
 
 class DashboardStats(BaseModel):

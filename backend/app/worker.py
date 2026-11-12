@@ -26,3 +26,12 @@ def execute_ingest_task(document_id: str) -> dict:
     with SessionLocal() as db:
         document = run_ingest_pipeline(db, document_id)
         return {"id": document.id, "status": document.status}
+
+
+@celery_app.task(name="experiment.execute_run")
+def execute_experiment_run_task(run_id: str) -> dict:
+    from .services.reprocess import execute_experiment_run
+
+    with SessionLocal() as db:
+        run = execute_experiment_run(db, run_id)
+        return {"id": run.id, "status": run.status}

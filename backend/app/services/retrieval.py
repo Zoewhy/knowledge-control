@@ -27,6 +27,14 @@ DOMAIN_EXPANSIONS = [
 ]
 
 
+def _scope_match(document, experiment_run_id: str | None) -> bool:
+    """实验副本隔离：默认排除打标副本；指定 experiment_run_id 时只查该 run 的副本。"""
+    run_id = (document.metadata_json or {}).get("experiment_run_id")
+    if experiment_run_id is None:
+        return run_id is None
+    return run_id == experiment_run_id
+
+
 @dataclass
 class BranchResult:
     hits: list[SearchHit] = field(default_factory=list)
@@ -62,7 +70,9 @@ def _citation(claim: SourceClaim) -> CitationRead:
     )
 
 
-def _section_citations(db: Session, section_id: str) -> list[CitationRead]:
+def _section_citations(
+    db: Session, section_id: str, experiment_run_id: str | None = None
+) -> list[CitationRead]:
     citations = db.scalars(
         select(WikiCitation)
         .where(WikiCitation.section_id == section_id)
@@ -72,19 +82,31 @@ def _section_citations(db: Session, section_id: str) -> list[CitationRead]:
             .selectinload(SourceSegment.document)
         )
     ).all()
-    return [_citation(citation.claim) for citation in citations]
+    return [
+        _citation(citation.claim)
+        for citation in citations
+        if _scope_match(citation.claim.segment.document, experiment_run_id)
+    ]
 
 
-def _segment_citations(db: Session, segment_id: str) -> list[CitationRead]:
+def _segment_citations(
+    db: Session, segment_id: str, experiment_run_id: str | None = None
+) -> list[CitationRead]:
     claims = db.scalars(
         select(SourceClaim)
         .where(SourceClaim.segment_id == segment_id)
         .options(selectinload(SourceClaim.segment).selectinload(SourceSegment.document))
     ).all()
-    return [_citation(claim) for claim in claims]
+    return [
+        _citation(claim)
+        for claim in claims
+        if _scope_match(claim.segment.document, experiment_run_id)
+    ]
 
 
-def _wiki_lexical(query: str, top_k: int) -> list[SearchHit]:
+def _wiki_lexical(
+    query: str, top_k: int, experiment_run_id: str | None = None
+) -> list[SearchHit]:
     with SessionLocal() as db:
         sections = db.scalars(select(WikiSection).options(selectinload(WikiSection.page))).all()
         hits = []
@@ -106,13 +128,17 @@ def _wiki_lexical(query: str, top_k: int) -> list[SearchHit]:
         return sorted(hits, key=lambda hit: hit.score, reverse=True)[: top_k * 2]
 
 
-def _source_lexical(query: str, top_k: int) -> list[SearchHit]:
+def _source_lexical(
+    query: str, top_k: int, experiment_run_id: str | None = None
+) -> list[SearchHit]:
     with SessionLocal() as db:
         segments = db.scalars(
             select(SourceSegment).options(selectinload(SourceSegment.document))
         ).all()
         hits = []
         for segment in segments:
+            if not _scope_match(segment.document, experiment_run_id):
+                continue
             title_score = lexical_score(query, f"{segment.document.title} {segment.heading or ''}")
             content_score = lexical_score(query, segment.content)
             score = max(content_score, min(1.0, title_score * 1.25))
@@ -129,7 +155,9 @@ def _source_lexical(query: str, top_k: int) -> list[SearchHit]:
         return sorted(hits, key=lambda hit: hit.score, reverse=True)[: top_k * 2]
 
 
-def _wiki_vector(query: str, top_k: int) -> list[SearchHit]:
+def _wiki_vector(
+    query: str, top_k: int, experiment_run_id: str | None = None
+) -> list[SearchHit]:
     if settings.is_sqlite:
         return []
     with SessionLocal() as db:
@@ -154,7 +182,9 @@ def _wiki_vector(query: str, top_k: int) -> list[SearchHit]:
         ]
 
 
-def _source_vector(query: str, top_k: int) -> list[SearchHit]:
+def _source_vector(
+    query: str, top_k: int, experiment_run_id: str | None = None
+) -> list[SearchHit]:
     if settings.is_sqlite:
         return []
     with SessionLocal() as db:
@@ -164,7 +194,7 @@ def _source_vector(query: str, top_k: int) -> list[SearchHit]:
             .where(SourceSegment.embedding.is_not(None))
             .options(selectinload(SourceSegment.document))
             .order_by(distance)
-            .limit(top_k * 2)
+            .limit(top_k * 4)
         ).all()
         return [
             SearchHit(
@@ -174,13 +204,30 @@ def _source_vector(query: str, top_k: int) -> list[SearchHit]:
                 title=segment.document.title,
                 content=segment.content,
             )
-            for segment, raw_distance in rows
+            for segment, raw_distance in rows[: top_k * 2]
+            if _scope_match(segment.document, experiment_run_id)
         ]
 
 
-def _elastic(query: str, top_k: int) -> list[SearchHit]:
+def _elastic(
+    query: str, top_k: int, experiment_run_id: str | None = None
+) -> list[SearchHit]:
+    raw_items = search_index.search(query, top_k * 2)
+    segment_ids = [item["segment_id"] for item in raw_items if item["kind"] == "segment"]
+    scope: dict[str, bool] = {}
+    if segment_ids:
+        with SessionLocal() as db:
+            rows = db.scalars(
+                select(SourceSegment)
+                .where(SourceSegment.id.in_(segment_ids))
+                .options(selectinload(SourceSegment.document))
+            ).all()
+            scope = {
+                segment.id: _scope_match(segment.document, experiment_run_id)
+                for segment in rows
+            }
     hits = []
-    for item in search_index.search(query, top_k * 2):
+    for item in raw_items:
         score = float(item["score"]) / (float(item["score"]) + 5.0)
         if item["kind"] == "section":
             hits.append(
@@ -194,6 +241,8 @@ def _elastic(query: str, top_k: int) -> list[SearchHit]:
                 )
             )
         elif item["kind"] == "segment":
+            if not scope.get(item["segment_id"], False):
+                continue
             hits.append(
                 SearchHit(
                     channel="elasticsearch_bm25",
@@ -206,7 +255,9 @@ def _elastic(query: str, top_k: int) -> list[SearchHit]:
     return hits
 
 
-def _run_branch(name: str, query: str, top_k: int) -> BranchResult:
+def _run_branch(
+    name: str, query: str, top_k: int, experiment_run_id: str | None = None
+) -> BranchResult:
     started = time.perf_counter()
     handlers = {
         "wiki_lexical": _wiki_lexical,
@@ -216,7 +267,7 @@ def _run_branch(name: str, query: str, top_k: int) -> BranchResult:
         "elasticsearch_bm25": _elastic,
     }
     try:
-        hits = handlers[name](query, top_k)
+        hits = handlers[name](query, top_k, experiment_run_id)
         return BranchResult(
             hits=hits, elapsed_ms=round((time.perf_counter() - started) * 1000, 2)
         )
@@ -258,6 +309,7 @@ def hybrid_search(
     include_answer: bool = True,
     disable_wiki: bool = False,
     disable_graph: bool = False,
+    experiment_run_id: str | None = None,
 ) -> SearchResponse:
     start = time.perf_counter()
     trace_id = uuid.uuid4().hex
@@ -285,7 +337,8 @@ def hybrid_search(
         ]
     executor = ThreadPoolExecutor(max_workers=settings.retrieval_max_workers)
     futures = {
-        name: executor.submit(_run_branch, name, retrieval_query, top_k) for name in branch_names
+        name: executor.submit(_run_branch, name, retrieval_query, top_k, experiment_run_id)
+        for name in branch_names
     }
     results: dict[str, BranchResult] = {}
     for name, future in futures.items():
@@ -343,9 +396,9 @@ def hybrid_search(
 
     for hit in merged.values():
         citations = (
-            _section_citations(db, hit.section_id)
+            _section_citations(db, hit.section_id, experiment_run_id)
             if hit.section_id
-            else _segment_citations(db, hit.segment_id)
+            else _segment_citations(db, hit.segment_id, experiment_run_id)
         )
         hit.citations = citations
         hit.source = citations[0] if citations else None
@@ -384,6 +437,7 @@ def hybrid_search(
         "query_expansions": expansions,
         "graph_paths": graph_paths,
         "ablation": {"disable_wiki": disable_wiki, "disable_graph": disable_graph},
+        "experiment_run_id": experiment_run_id,
     }
     return SearchResponse(
         query=query,

@@ -320,7 +320,60 @@ class EvaluationCase(Base):
     question_type: Mapped[str] = mapped_column(
         String(40), default="general", server_default="general"
     )
+    eval_group: Mapped[str] = mapped_column(
+        String(60), default="default", server_default="default"
+    )
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class IngestPolicy(Base):
+    __tablename__ = "ingest_policies"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    doc_pattern: Mapped[str] = mapped_column(String(300), default="*")
+    parser_strategy: Mapped[str] = mapped_column(String(40), default="auto")
+    chunk_strategy: Mapped[str] = mapped_column(String(40), default="heading")
+    chunk_params: Mapped[dict] = mapped_column(JSON, default=dict)
+    table_mode: Mapped[str] = mapped_column(String(40), default="chunk")
+    min_text_chars: Mapped[int] = mapped_column(Integer, default=100)
+    auto_compile: Mapped[bool] = mapped_column(Boolean, default=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class StrategyExperiment(Base):
+    __tablename__ = "strategy_experiments"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(300))
+    document_ids: Mapped[list] = mapped_column(JSON, default=list)
+    eval_group: Mapped[str] = mapped_column(String(60), default="default")
+    target_metrics: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    applied_run_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    runs: Mapped[list["StrategyExperimentRun"]] = relationship(
+        back_populates="experiment", cascade="all, delete-orphan"
+    )
+
+
+class StrategyExperimentRun(Base):
+    __tablename__ = "strategy_experiment_runs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    experiment_id: Mapped[str] = mapped_column(
+        ForeignKey("strategy_experiments.id"), index=True
+    )
+    policy_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(40), default="pending")
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    eval_run_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    experiment: Mapped[StrategyExperiment] = relationship(back_populates="runs")
 
 
 class EvaluationRun(Base):

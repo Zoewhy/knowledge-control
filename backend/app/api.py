@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -33,6 +34,7 @@ from .models import (
     EvaluationCase,
     EvaluationRun,
     IncidentRecord,
+    IngestPolicy,
     IntegrationEvent,
     QaRequirement,
     QaTestSuite,
@@ -41,6 +43,8 @@ from .models import (
     SourceClaim,
     SourceDocument,
     SourceSegment,
+    StrategyExperiment,
+    StrategyExperimentRun,
     TaskStatus,
     WikiCitation,
     WikiPage,
@@ -62,8 +66,14 @@ from .schemas import (
     EvaluationCompareResponse,
     EvaluationRunRead,
     EvaluationRunRequest,
+    EvaluationSetImport,
+    ExperimentApplyRequest,
+    ExperimentCreate,
     FeishuDocumentImport,
     IncidentRecordRead,
+    IngestPolicyCreate,
+    IngestPolicyRead,
+    IngestPolicyUpdate,
     IntegrationEventRead,
     QaRequirementCreate,
     QaRequirementRead,
@@ -72,9 +82,11 @@ from .schemas import (
     ReviewTaskRead,
     SearchRequest,
     SearchResponse,
+    StrategyExperimentRead,
     WikiPageRead,
 )
 from .services.agent_runtime import create_task, registry
+from .services.chunkers import get_chunker
 from .services.compiler import compile_claims, decide_review
 from .services.evaluation import run_evaluation
 from .services.feishu import FeishuError, feishu_client
@@ -91,9 +103,18 @@ from .services.integrations import (
     ingest_alert,
 )
 from .services.llm import llm
+from .services.policies import (
+    DEFAULT_POLICY_NAME,
+    ensure_default_policy,
+    policy_snapshot,
+    should_auto_compile,
+)
 from .services.qa_tools import build_suite_report
+from .services.reprocess import dispatch_experiment_run
 from .services.retrieval import hybrid_search
 from .services.scheduler import dispatch_task
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -138,7 +159,7 @@ def dashboard(db: Session = Depends(get_db)) -> DashboardStats:
 @router.post("/documents", response_model=DocumentRead, status_code=status.HTTP_201_CREATED)
 def create_document(payload: DocumentCreate, db: Session = Depends(get_db)):
     document, created = ingest_document(db, payload)
-    if payload.compile and created:
+    if payload.compile and created and should_auto_compile(db, document):
         compile_document(db, document)
     return db.scalar(_document_query(document.id))
 
@@ -250,7 +271,11 @@ def create_document_batch(payload: DocumentBatchCreate, db: Session = Depends(ge
     results = []
     for item in payload.documents:
         document, created = ingest_document(db, item)
-        compile_result = compile_document(db, document) if item.compile and created else {}
+        compile_result = (
+            compile_document(db, document)
+            if item.compile and created and should_auto_compile(db, document)
+            else {}
+        )
         results.append(
             {
                 "document_id": document.id,
@@ -278,7 +303,7 @@ def import_feishu_document(payload: FeishuDocumentImport, db: Session = Depends(
         compile=payload.compile,
     )
     document, created = ingest_document(db, document_payload)
-    if payload.compile and created:
+    if payload.compile and created and should_auto_compile(db, document):
         compile_document(db, document)
     return db.scalar(_document_query(document.id))
 
@@ -540,7 +565,7 @@ def reflow_agent_artifact(artifact_id: str, db: Session = Depends(get_db)):
         },
     )
     document, created = ingest_document(db, payload)
-    if created:
+    if created and should_auto_compile(db, document):
         compile_document(db, document)
     artifact.document_id = document.id
     db.add(
@@ -568,7 +593,8 @@ def add_evaluation_run(
     payload: Optional[EvaluationRunRequest] = None, db: Session = Depends(get_db)
 ):
     arm = payload.arm if payload else "G3"
-    run = run_evaluation(db, arm=arm)
+    eval_group = payload.eval_group if payload else None
+    run = run_evaluation(db, arm=arm, eval_group=eval_group)
     return db.scalar(
         select(EvaluationRun)
         .where(EvaluationRun.id == run.id)
@@ -856,6 +882,176 @@ def qa_suite_reflow(suite_id: str, db: Session = Depends(get_db)):
             metadata={"suite_id": suite.id, "requirement_id": suite.requirement_id},
         ),
     )
-    if created:
+    if created and should_auto_compile(db, document):
         compile_document(db, document)
     return db.scalar(_document_query(document.id))
+
+
+# ---------- 入库策略 ----------
+
+
+def _validate_chunk_strategy(chunk_strategy: str) -> None:
+    try:
+        get_chunker(chunk_strategy)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.get("/ingest-policies", response_model=list[IngestPolicyRead])
+def list_ingest_policies(db: Session = Depends(get_db)):
+    ensure_default_policy(db)
+    db.commit()
+    return list(db.scalars(select(IngestPolicy).order_by(IngestPolicy.created_at)).all())
+
+
+@router.post(
+    "/ingest-policies", response_model=IngestPolicyRead, status_code=status.HTTP_201_CREATED
+)
+def create_ingest_policy(payload: IngestPolicyCreate, db: Session = Depends(get_db)):
+    _validate_chunk_strategy(payload.chunk_strategy)
+    if payload.name == DEFAULT_POLICY_NAME:
+        raise HTTPException(409, "default 为内置只读策略")
+    if db.scalar(select(IngestPolicy).where(IngestPolicy.name == payload.name)):
+        raise HTTPException(409, "同名策略已存在")
+    policy = IngestPolicy(**payload.model_dump())
+    db.add(policy)
+    db.commit()
+    db.refresh(policy)
+    return policy
+
+
+@router.patch("/ingest-policies/{policy_id}", response_model=IngestPolicyRead)
+def update_ingest_policy(
+    policy_id: str, payload: IngestPolicyUpdate, db: Session = Depends(get_db)
+):
+    policy = db.get(IngestPolicy, policy_id)
+    if not policy:
+        raise HTTPException(404, "策略不存在")
+    if policy.name == DEFAULT_POLICY_NAME:
+        raise HTTPException(409, "default 为内置只读策略")
+    updates = payload.model_dump(exclude_none=True)
+    if "chunk_strategy" in updates:
+        _validate_chunk_strategy(updates["chunk_strategy"])
+    for field, value in updates.items():
+        setattr(policy, field, value)
+    policy.version += 1
+    db.commit()
+    db.refresh(policy)
+    return policy
+
+
+@router.delete("/ingest-policies/{policy_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_ingest_policy(policy_id: str, db: Session = Depends(get_db)):
+    policy = db.get(IngestPolicy, policy_id)
+    if not policy:
+        raise HTTPException(404, "策略不存在")
+    if policy.name == DEFAULT_POLICY_NAME:
+        raise HTTPException(409, "default 为内置只读策略")
+    db.delete(policy)
+    db.commit()
+
+
+# ---------- 问答集导入 ----------
+
+
+@router.post("/evaluations/sets/import", status_code=status.HTTP_201_CREATED)
+def import_evaluation_set(payload: EvaluationSetImport, db: Session = Depends(get_db)):
+    existing_titles = set(db.scalars(select(SourceDocument.title)).all())
+    created = 0
+    updated = 0
+    warnings: list[str] = []
+    for index, item in enumerate(payload.cases, start=1):
+        name = item.name or f"{payload.eval_group}-{index:03d}"
+        case = db.scalar(
+            select(EvaluationCase).where(
+                EvaluationCase.eval_group == payload.eval_group,
+                EvaluationCase.name == name,
+            )
+        )
+        missing = [title for title in item.expected_sources if title not in existing_titles]
+        if missing:
+            warnings.append(f"{name}: 期望来源不存在 {missing}")
+        values = {
+            "query": item.query,
+            "expected_sources": item.expected_sources,
+            "expected_keywords": item.expected_keywords,
+            "question_type": item.question_type,
+        }
+        if case:
+            for field, value in values.items():
+                setattr(case, field, value)
+            updated += 1
+        else:
+            db.add(EvaluationCase(name=name, eval_group=payload.eval_group, **values))
+            created += 1
+    db.commit()
+    return {"eval_group": payload.eval_group, "created": created, "updated": updated,
+            "warnings": warnings}
+
+
+# ---------- 策略对比实验 ----------
+
+
+@router.post(
+    "/experiments",
+    response_model=StrategyExperimentRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_experiment(payload: ExperimentCreate, db: Session = Depends(get_db)):
+    for document_id in payload.document_ids:
+        if db.get(SourceDocument, document_id) is None:
+            raise HTTPException(404, f"文档不存在: {document_id}")
+    experiment = StrategyExperiment(
+        name=payload.name,
+        document_ids=payload.document_ids,
+        eval_group=payload.eval_group,
+    )
+    db.add(experiment)
+    db.flush()
+    for policy_id in payload.policy_ids:
+        policy = db.get(IngestPolicy, policy_id)
+        if policy is None:
+            raise HTTPException(404, f"策略不存在: {policy_id}")
+        db.add(
+            StrategyExperimentRun(
+                experiment_id=experiment.id,
+                policy_snapshot=policy_snapshot(policy),
+                status="pending",
+            )
+        )
+    db.commit()
+    for run in experiment.runs:
+        dispatch_experiment_run(db, run)
+    db.refresh(experiment)
+    return experiment
+
+
+@router.get("/experiments/{experiment_id}", response_model=StrategyExperimentRead)
+def get_experiment(experiment_id: str, db: Session = Depends(get_db)):
+    experiment = db.get(StrategyExperiment, experiment_id)
+    if not experiment:
+        raise HTTPException(404, "实验不存在")
+    return experiment
+
+
+@router.post("/experiments/{experiment_id}/apply")
+def apply_experiment(
+    experiment_id: str, payload: ExperimentApplyRequest, db: Session = Depends(get_db)
+):
+    experiment = db.get(StrategyExperiment, experiment_id)
+    if not experiment:
+        raise HTTPException(404, "实验不存在")
+    run = db.get(StrategyExperimentRun, payload.run_id)
+    if not run or run.experiment_id != experiment.id:
+        raise HTTPException(404, "实验 Run 不存在")
+    if run.status != "done":
+        raise HTTPException(409, "只能应用已完成的 Run")
+    experiment.applied_run_id = run.id
+    db.commit()
+    logger.info(
+        "experiment %s applied run %s (policy %s)",
+        experiment.id,
+        run.id,
+        (run.policy_snapshot or {}).get("name"),
+    )
+    return {"experiment_id": experiment.id, "applied_run_id": run.id}

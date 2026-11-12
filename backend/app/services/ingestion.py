@@ -7,20 +7,20 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..models import DocumentFile, SourceClaim, SourceDocument, SourceSegment
+from ..models import DocumentFile, IngestPolicy, SourceClaim, SourceDocument, SourceSegment
 from ..schemas import DocumentCreate
+from .chunkers import get_chunker
 from .graph import extract_dependencies_to_graph
 from .llm import llm
 from .parsing import parse_document
 from .parsing.types import ImageBlock, TableBlock, TextBlock
+from .policies import resolve_policy
 from .search_index import search_index
 from .text import (
     SegmentDraft,
     count_tokens,
     fingerprint,
     split_markdown,
-    split_text_block,
-    table_to_markdown,
 )
 
 INGEST_STEPS = ("parsing", "chunking", "extracting", "indexing", "compiling")
@@ -55,6 +55,19 @@ def _index_claim_dependencies(db: Session, claims: list[SourceClaim]) -> None:
             logger.warning("dependency extraction failed for claim %s: %s", claim.id, exc)
 
 
+def _chunk_raw_content(content: str, policy: IngestPolicy) -> list[SegmentDraft]:
+    """同步入库（无文件块）按策略切分；heading 走 split_markdown 保持现状行为。"""
+    params = dict(policy.chunk_params or {})
+    if policy.chunk_strategy == "heading":
+        return split_markdown(
+            content,
+            max_tokens=int(params.get("max_tokens", 512)),
+            overlap_tokens=int(params.get("overlap_tokens", 50)),
+        )
+    blocks = [{"type": "text", "heading_path": [], "content": content}]
+    return get_chunker(policy.chunk_strategy)(blocks, params)
+
+
 def ingest_document(db: Session, payload: DocumentCreate) -> tuple[SourceDocument, bool]:
     checksum = fingerprint(payload.content)
     existing = db.scalar(select(SourceDocument).where(SourceDocument.checksum == checksum))
@@ -73,7 +86,8 @@ def ingest_document(db: Session, payload: DocumentCreate) -> tuple[SourceDocumen
     )
     db.add(document)
     db.flush()
-    for ordinal, draft in enumerate(split_markdown(payload.content)):
+    policy = resolve_policy(db, document)
+    for ordinal, draft in enumerate(_chunk_raw_content(payload.content, policy)):
         segment = SourceSegment(
             document_id=document.id,
             ordinal=ordinal,
@@ -114,30 +128,41 @@ def store_upload(filename: str, raw: bytes, checksum: str) -> str:
     return str(target)
 
 
-def _serialize_blocks(document: SourceDocument, raw: bytes, mime: str) -> list[dict]:
-    parsed = parse_document(document.file.filename, raw, mime)
+def build_blocks(
+    filename: str,
+    raw: bytes,
+    mime: str,
+    *,
+    title: str,
+    parser_strategy: str = "auto",
+    min_text_chars: int = PDF_MIN_TEXT_CHARS,
+) -> tuple[list[dict], dict, list[str]]:
+    """解析原文为序列化块；text_only 策略跳过图片 VL 描述直接记占位。"""
+    parsed = parse_document(filename, raw, mime)
+    warnings: list[str] = []
     if mime == "application/pdf":
         text_chars = parsed.meta.get("text_chars", 0)
         scanned_pages = parsed.meta.get("scanned_pages")
         if text_chars == 0 and not scanned_pages:
             raise ValueError("PDF 未提取到任何文本且非扫描件，解析疑似失败")
-        if 0 < text_chars < PDF_MIN_TEXT_CHARS and not scanned_pages:
-            warnings = list(document.metadata_json.get("parse_warnings", []))
+        if 0 < text_chars < min_text_chars and not scanned_pages:
             warnings.append(f"文本量较少（{text_chars} 字符），请确认原文是否完整")
-            document.metadata_json = {**document.metadata_json, "parse_warnings": warnings}
     blocks: list[dict] = []
     for block in parsed.blocks:
         if isinstance(block, ImageBlock):
-            try:
-                description = llm.describe_image(block.image_bytes, hint=document.title)
-            except Exception:
-                description = ""
-            block.caption = description.strip() or "[图片解析失败]"
+            if parser_strategy == "text_only":
+                caption = "[图片已跳过]"
+            else:
+                try:
+                    caption = llm.describe_image(block.image_bytes, hint=title).strip()
+                except Exception:
+                    caption = ""
+                caption = caption or "[图片解析失败]"
             blocks.append(
                 {
                     "type": "image",
                     "heading_path": block.heading_path,
-                    "description": block.caption,
+                    "description": caption,
                 }
             )
         elif isinstance(block, TableBlock):
@@ -153,32 +178,29 @@ def _serialize_blocks(document: SourceDocument, raw: bytes, mime: str) -> list[d
             blocks.append(
                 {"type": "text", "heading_path": block.heading_path, "content": block.content}
             )
-    document.metadata_json = {**document.metadata_json, "parse_meta": parsed.meta}
+    return blocks, parsed.meta, warnings
+
+
+def _serialize_blocks(
+    document: SourceDocument, raw: bytes, mime: str, policy: IngestPolicy
+) -> list[dict]:
+    filename = document.file.filename if document.file else "document.md"
+    blocks, meta, warnings = build_blocks(
+        filename,
+        raw,
+        mime,
+        title=document.title,
+        parser_strategy=policy.parser_strategy,
+        min_text_chars=policy.min_text_chars,
+    )
+    metadata = {**document.metadata_json, "parse_meta": meta}
+    if warnings:
+        metadata["parse_warnings"] = [
+            *document.metadata_json.get("parse_warnings", []),
+            *warnings,
+        ]
+    document.metadata_json = metadata
     return blocks
-
-
-def _drafts_from_blocks(blocks: list[dict]) -> list[SegmentDraft]:
-    drafts: list[SegmentDraft] = []
-    for block in blocks:
-        heading_path = list(block.get("heading_path") or [])
-        heading = heading_path[-1] if heading_path else None
-        if block["type"] == "table":
-            content = table_to_markdown(block["headers"], block["rows"])
-            drafts.append(
-                SegmentDraft(
-                    heading=heading,
-                    heading_path=heading_path,
-                    content=content,
-                    segment_type="table",
-                )
-            )
-        else:
-            content = block.get("content") or block.get("description") or ""
-            segment_type = "image" if block["type"] == "image" else "text"
-            for draft in split_text_block(content, heading_path):
-                draft.segment_type = segment_type
-                drafts.append(draft)
-    return [draft for draft in drafts if draft.content.strip()]
 
 
 def _mark_step(db: Session, document: SourceDocument, step: str) -> None:
@@ -198,6 +220,7 @@ def run_ingest_pipeline(db: Session, document_id: str) -> SourceDocument:
         raise ValueError(f"document not found: {document_id}")
     step = "parsing"
     try:
+        policy = resolve_policy(db, document)
         document_file = document.file or (
             db.get(DocumentFile, document.file_id) if document.file_id else None
         )
@@ -207,7 +230,7 @@ def run_ingest_pipeline(db: Session, document_id: str) -> SourceDocument:
         if not isinstance(blocks, list) or not blocks:
             _mark_step(db, document, "parsing")
             raw = Path(document_file.storage_path).read_bytes()
-            blocks = _serialize_blocks(document, raw, document_file.mime)
+            blocks = _serialize_blocks(document, raw, document_file.mime, policy)
             document.metadata_json = {**document.metadata_json, "blocks": blocks}
             db.commit()
 
@@ -219,7 +242,8 @@ def run_ingest_pipeline(db: Session, document_id: str) -> SourceDocument:
             .where(SourceSegment.document_id == document.id)
         )
         if not segment_count:
-            drafts = _drafts_from_blocks(blocks)
+            chunker = get_chunker(policy.chunk_strategy)
+            drafts = chunker(blocks, dict(policy.chunk_params or {}))
             if not drafts:
                 raise ValueError("未解析出可用内容")
             for ordinal, draft in enumerate(drafts):
@@ -279,7 +303,7 @@ def run_ingest_pipeline(db: Session, document_id: str) -> SourceDocument:
             _index_claim_dependencies(db, new_claims)
         db.commit()
 
-        if document.metadata_json.get("compile", True):
+        if policy.auto_compile and document.metadata_json.get("compile", True):
             step = "compiling"
             _mark_step(db, document, "compiling")
             db.refresh(document)

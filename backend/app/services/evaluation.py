@@ -40,11 +40,11 @@ def _aggregate_by_type(rows: list[dict]) -> dict[str, dict]:
 
 def source_hit(case: EvaluationCase, response: SearchResponse) -> float:
     source_titles = {
-        citation.document_title
+        citation.document_title.removeprefix("[实验] ")
         for hit in response.hits
         for citation in hit.citations
     }
-    source_titles.update(hit.title for hit in response.hits)
+    source_titles.update(hit.title.removeprefix("[实验] ") for hit in response.hits)
     return float(
         not case.expected_sources
         or any(expected in source_titles for expected in case.expected_sources)
@@ -110,16 +110,23 @@ class EvaluationEngine:
     def __init__(self, registry: ScorerRegistry) -> None:
         self.registry = registry
 
-    def run(self, db: Session, arm: str = "G3") -> EvaluationRun:
+    def run(
+        self,
+        db: Session,
+        arm: str = "G3",
+        experiment_run_id: str | None = None,
+        eval_group: str | None = None,
+    ) -> EvaluationRun:
         if arm not in ARM_FLAGS:
             raise ValueError(f"unknown evaluation arm: {arm}")
         disable_wiki, disable_graph = ARM_FLAGS[arm]
         run = EvaluationRun()
         db.add(run)
         db.flush()
-        cases = list(
-            db.scalars(select(EvaluationCase).where(EvaluationCase.enabled.is_(True))).all()
-        )
+        query = select(EvaluationCase).where(EvaluationCase.enabled.is_(True))
+        if eval_group:
+            query = query.where(EvaluationCase.eval_group == eval_group)
+        cases = list(db.scalars(query).all())
         rows: list[dict] = []
         try:
             for case in cases:
@@ -129,6 +136,7 @@ class EvaluationEngine:
                     top_k=8,
                     disable_wiki=disable_wiki,
                     disable_graph=disable_graph,
+                    experiment_run_id=experiment_run_id,
                 )
                 metrics = self.registry.score(case, response)
                 metrics["latency_ms"] = response.latency_ms
@@ -165,6 +173,8 @@ class EvaluationEngine:
             run.metrics = {
                 "arm": arm,
                 "cases": len(rows),
+                "eval_group": eval_group or "default",
+                "experiment_run_id": experiment_run_id,
                 **{
                     name: round(mean([row[name] for row in rows]), 4) if rows else 0
                     for name in (
@@ -196,5 +206,10 @@ class EvaluationEngine:
 engine = EvaluationEngine(scorer_registry)
 
 
-def run_evaluation(db: Session, arm: str = "G3") -> EvaluationRun:
-    return engine.run(db, arm=arm)
+def run_evaluation(
+    db: Session,
+    arm: str = "G3",
+    experiment_run_id: str | None = None,
+    eval_group: str | None = None,
+) -> EvaluationRun:
+    return engine.run(db, arm=arm, experiment_run_id=experiment_run_id, eval_group=eval_group)
